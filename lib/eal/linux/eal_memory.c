@@ -3,6 +3,7 @@
  * Copyright(c) 2013 6WIND S.A.
  */
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
@@ -27,6 +28,7 @@
 #include <numaif.h>
 #endif
 
+#include <rte_byteorder.h>
 #include <rte_errno.h>
 #include <rte_log.h>
 #include <rte_memory.h>
@@ -82,6 +84,262 @@ uint64_t eal_get_baseaddr(void)
 #else
 	return 0x100000000ULL;
 #endif
+}
+
+/*
+ * On some platforms the address space seen by PCIe devices is not the CPU
+ * physical address space: the host bridge applies a fixed translation to
+ * inbound (device-to-memory) traffic.  There, an IOVA in RTE_IOVA_PA mode is
+ * *not* a CPU physical address -- a device DMAing to CPU physical address P
+ * must be programmed with P + offset, or its reads and writes fall outside the
+ * bridge's inbound window and are silently discarded.
+ *
+ * This was found on a Broadcom BCM2711 (Raspberry Pi Compute Module 4, 4GB),
+ * whose host bridge node pcie@7d500000 declares in "dma-ranges" that CPU
+ * physical 0 is reached by devices at PCIe address 0x4_0000_0000 (its outbound
+ * window, in "ranges", starts at PCIe address 0xc000_0000).  Without the
+ * translation every DPDK descriptor ring and mbuf address handed to the NIC is
+ * unreachable, and the observed symptom was a device that reported link up and
+ * counted packets in its own registers while never completing a single DMA.
+ *
+ * The translation is read from the "dma-ranges" property of the PCI host
+ * bridge in the device tree, so each platform gets the value it declares
+ * rather than one assumed here.  It is zero on identity-mapped platforms and
+ * absent where there is no device tree (x86), and everything below is then a
+ * no-op.
+ */
+#define DT_ROOT_PATH		"/proc/device-tree"
+#define IOVA_PA_OFFSET_ENV	"DPDK_IOVA_PA_OFFSET"
+#define IOVA_PA_OFFSET_UNSET	UINT64_MAX
+#define DT_MAX_SCAN_DEPTH	4
+
+/*
+ * Cached PCIe-bus-address-minus-CPU-physical-address translation.  Written at
+ * most once with a value that does not depend on who computes it, and it is a
+ * single aligned 64-bit store, so the benign race between threads racing to
+ * fill it in cannot produce a torn or inconsistent result.
+ */
+static uint64_t iova_pa_offset = IOVA_PA_OFFSET_UNSET;
+
+/* Read a device-tree property into buf, storing its length in *outlen. */
+static int
+dt_read_prop(const char *dir, const char *prop, void *buf, size_t buflen,
+		size_t *outlen)
+{
+	char path[PATH_MAX];
+	size_t n;
+	FILE *f;
+
+	if (snprintf(path, sizeof(path), "%s/%s", dir, prop) >= (int)sizeof(path))
+		return -1;
+	f = fopen(path, "rb");
+	if (f == NULL)
+		return -1;
+	n = fread(buf, 1, buflen, f);
+	if (ferror(f)) {
+		fclose(f);
+		return -1;
+	}
+	fclose(f);
+	*outlen = n;
+	return 0;
+}
+
+/* Read a single-cell device-tree property, e.g. #address-cells. */
+static int
+dt_read_u32(const char *dir, const char *prop, uint32_t *out)
+{
+	uint32_t val;
+	size_t len;
+
+	if (dt_read_prop(dir, prop, &val, sizeof(val), &len) < 0 ||
+			len != sizeof(val))
+		return -1;
+	*out = rte_be_to_cpu_32(val);
+	return 0;
+}
+
+/* Device-tree addresses are big-endian sequences of 32-bit cells. */
+static uint64_t
+dt_read_cells(const uint32_t *cells, uint32_t n)
+{
+	uint64_t val = 0;
+	uint32_t i;
+
+	for (i = 0; i < n; i++)
+		val = (val << 32) | rte_be_to_cpu_32(cells[i]);
+	return val;
+}
+
+/*
+ * Derive the inbound translation from the "dma-ranges" of one PCI host bridge.
+ * Each entry is <pci-address> <parent-address> <size>, where a PCI address is
+ * always 3 cells (phys.hi holds flags, phys.mid/phys.lo hold the address), the
+ * parent address is the parent bus' #address-cells, and the size is this node's
+ * #size-cells.
+ */
+static int
+dt_pci_dma_offset(const char *node, const char *parent, uint64_t *offset)
+{
+	uint32_t cells[256];
+	uint32_t parent_ac, size_c;
+	size_t len, ncells, per_entry, i;
+	uint64_t off = 0;
+	bool first = true;
+
+	if (dt_read_prop(node, "dma-ranges", cells, sizeof(cells), &len) < 0)
+		return -1;
+
+	/* An empty "dma-ranges" declares the bus to be identity mapped. */
+	if (len == 0) {
+		*offset = 0;
+		return 0;
+	}
+
+	if (dt_read_u32(parent, "#address-cells", &parent_ac) < 0 ||
+			dt_read_u32(node, "#size-cells", &size_c) < 0)
+		return -1;
+	/* More than 2 cells cannot be held in a uint64_t. */
+	if (parent_ac == 0 || parent_ac > 2 || size_c > 2)
+		return -1;
+
+	per_entry = 3 + parent_ac + size_c;
+	ncells = len / sizeof(uint32_t);
+	if (ncells == 0 || ncells % per_entry != 0)
+		return -1;
+
+	for (i = 0; i < ncells; i += per_entry) {
+		uint64_t pci_addr = dt_read_cells(&cells[i + 1], 2);
+		uint64_t cpu_addr = dt_read_cells(&cells[i + 3], parent_ac);
+		uint64_t entry_off = pci_addr - cpu_addr;
+
+		if (first) {
+			off = entry_off;
+			first = false;
+		} else if (entry_off != off) {
+			/*
+			 * The bridge translates different regions differently,
+			 * which a single offset cannot express.  Refuse to
+			 * guess rather than corrupt every IOVA.
+			 */
+			EAL_LOG(WARNING,
+				"%s: non-uniform dma-ranges, cannot derive an IOVA offset",
+				node);
+			return -1;
+		}
+	}
+
+	*offset = off;
+	return 0;
+}
+
+/*
+ * Walk the device tree looking for a PCI host bridge that describes a non-zero
+ * inbound translation, and report the first one found.  Systems with several
+ * host bridges translating differently would need per-device IOVAs, which the
+ * IOVA-as-PA model cannot express; we log the node we used so a mismatch is
+ * visible rather than silent.
+ */
+static int
+dt_scan_pci_dma_offset(const char *dir, const char *parent, int depth,
+		uint64_t *offset, char *node, size_t node_len)
+{
+	struct dirent *ent;
+	int ret = -1;
+	DIR *d;
+
+	if (depth > DT_MAX_SCAN_DEPTH)
+		return -1;
+
+	if (parent != NULL) {
+		char type[16];
+		size_t len;
+
+		if (dt_read_prop(dir, "device_type", type, sizeof(type) - 1,
+				&len) == 0) {
+			type[len] = '\0';
+			if (strcmp(type, "pci") == 0 &&
+					dt_pci_dma_offset(dir, parent,
+						offset) == 0 && *offset != 0) {
+				strlcpy(node, dir, node_len);
+				return 0;
+			}
+		}
+	}
+
+	d = opendir(dir);
+	if (d == NULL)
+		return -1;
+	while ((ent = readdir(d)) != NULL) {
+		char child[PATH_MAX];
+
+		/* Skip ".", "..", and the device tree's own dot-properties. */
+		if (ent->d_name[0] == '.')
+			continue;
+		/* procfs may not fill in d_type; opendir() filters non-dirs. */
+		if (ent->d_type != DT_DIR && ent->d_type != DT_UNKNOWN)
+			continue;
+		if (snprintf(child, sizeof(child), "%s/%s", dir,
+				ent->d_name) >= (int)sizeof(child))
+			continue;
+		if (dt_scan_pci_dma_offset(child, dir, depth + 1, offset,
+				node, node_len) == 0) {
+			ret = 0;
+			break;
+		}
+	}
+	closedir(d);
+	return ret;
+}
+
+/* Offset to add to a CPU physical address to obtain the address a PCIe device
+ * must use to reach it.  Zero on identity-mapped platforms.
+ */
+static uint64_t
+eal_iova_pa_offset(void)
+{
+	char node[PATH_MAX] = "";
+	uint64_t offset = 0;
+	const char *env;
+	char *end;
+
+	if (iova_pa_offset != IOVA_PA_OFFSET_UNSET)
+		return iova_pa_offset;
+
+	env = getenv(IOVA_PA_OFFSET_ENV);
+	if (env != NULL && env[0] != '\0') {
+		errno = 0;
+		offset = strtoull(env, &end, 0);
+		if (errno != 0 || *end != '\0') {
+			EAL_LOG(ERR, "Invalid %s value '%s', assuming no offset",
+				IOVA_PA_OFFSET_ENV, env);
+			offset = 0;
+		} else {
+			EAL_LOG(NOTICE,
+				"Using IOVA offset 0x%" PRIx64 " from %s",
+				offset, IOVA_PA_OFFSET_ENV);
+		}
+	} else if (dt_scan_pci_dma_offset(DT_ROOT_PATH, NULL, 0, &offset,
+			node, sizeof(node)) == 0) {
+		EAL_LOG(NOTICE,
+			"PCIe bus addresses are offset by 0x%" PRIx64
+			" from CPU physical addresses (%s/dma-ranges); applying it to IOVAs",
+			offset, node);
+	} else {
+		offset = 0;
+	}
+
+	iova_pa_offset = offset;
+	return offset;
+}
+
+/* Convert a CPU physical address into the IOVA a device must be given. */
+static rte_iova_t
+eal_pa_to_iova(phys_addr_t pa)
+{
+	if (pa == RTE_BAD_IOVA)
+		return RTE_BAD_IOVA;
+	return pa + eal_iova_pa_offset();
 }
 
 /*
@@ -149,7 +407,7 @@ rte_mem_virt2iova(const void *virtaddr)
 {
 	if (rte_eal_iova_mode() == RTE_IOVA_VA)
 		return (uintptr_t)virtaddr;
-	return rte_mem_virt2phy(virtaddr);
+	return eal_pa_to_iova(rte_mem_virt2phy(virtaddr));
 }
 
 /*
@@ -781,7 +1039,10 @@ remap_segment(struct hugepage_file *hugepages, int seg_start, int seg_end)
 		ms->addr = addr;
 		ms->hugepage_sz = page_sz;
 		ms->len = memseg_len;
-		ms->iova = hfile->physaddr;
+		/* In IOVA-as-VA mode physaddr has been rewritten to the VA. */
+		ms->iova = rte_eal_iova_mode() == RTE_IOVA_VA ?
+				hfile->physaddr :
+				eal_pa_to_iova(hfile->physaddr);
 		ms->socket_id = hfile->socket_id;
 		ms->nchannel = rte_memory_get_nchannel();
 		ms->nrank = rte_memory_get_nrank();
