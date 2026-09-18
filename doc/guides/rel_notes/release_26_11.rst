@@ -55,6 +55,14 @@ New Features
      Also, make sure to start the actual text at the margin.
      =======================================================
 
+* **Added PCIe inbound DMA address translation on Linux.**
+
+  EAL now reads the PCIe host bridge "dma-ranges" property from the device
+  tree and applies the translation it declares to IOVAs, so devices on a
+  platform whose inbound window is not identity-mapped, such as the
+  Broadcom BCM2711 on Raspberry Pi 4 and Compute Module 4, can reach
+  system memory.
+
 
 Removed Items
 -------------
