@@ -63,6 +63,14 @@ New Features
   Broadcom BCM2711 on Raspberry Pi 4 and Compute Module 4, can reach
   system memory.
 
+* **Added non-coherent DMA support to the e1000 (igb) driver.**
+
+  The driver now performs the cache maintenance required on a PCIe bus
+  that is not cache coherent, taking TX completion from the hardware head
+  register and refilling RX descriptors a cache line at a time.  It is
+  enabled when the device is described by a device tree whose bus does not
+  declare "dma-coherent", on arm64.
+
 
 Removed Items
 -------------
