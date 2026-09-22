@@ -459,6 +459,14 @@ end:
 	return ret;
 }
 
+RTE_EXPORT_INTERNAL_SYMBOL(rte_pci_dma_is_coherent)
+bool
+rte_pci_dma_is_coherent(const struct rte_pci_device *dev)
+{
+	RTE_SET_USED(dev);
+	return true;
+}
+
 /*
  * Scan the contents of the PCI bus
  * and add all network class devices into the devices list.

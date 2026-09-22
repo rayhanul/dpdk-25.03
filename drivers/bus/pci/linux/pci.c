@@ -220,6 +220,11 @@ pci_scan_one(const char *dirname, const struct rte_pci_addr *addr)
 	dev = &pdev->device;
 	dev->addr = *addr;
 
+	if (pci_dt_set_dma_offset(dirname) < 0) {
+		pci_free(pdev);
+		return -1;
+	}
+
 	/* get vendor id */
 	snprintf(filename, sizeof(filename), "%s/vendor", dirname);
 	if (eal_parse_sysfs_value(filename, &tmp) < 0) {

@@ -330,6 +330,14 @@ skipdev:
 	return 0;
 }
 
+RTE_EXPORT_INTERNAL_SYMBOL(rte_pci_dma_is_coherent)
+bool
+rte_pci_dma_is_coherent(const struct rte_pci_device *dev)
+{
+	RTE_SET_USED(dev);
+	return true;
+}
+
 /*
  * Scan the content of the PCI bus, and add the devices in the devices
  * list. Call pci_scan_one() for each pci entry found.

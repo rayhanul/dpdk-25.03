@@ -10,6 +10,7 @@ if is_linux
     sources += files(
             'pci_common_uio.c',
             'linux/pci.c',
+            'linux/pci_dma_ranges.c',
             'linux/pci_uio.c',
             'linux/pci_vfio.c',
     )
