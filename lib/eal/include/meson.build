@@ -32,6 +32,7 @@ headers += files(
         'rte_lock_annotations.h',
         'rte_malloc.h',
         'rte_mcslock.h',
+        'rte_mem_sync.h',
         'rte_memory.h',
         'rte_memzone.h',
         'rte_pci_dev_feature_defs.h',
