@@ -283,6 +283,7 @@ struct e1000_adapter {
 	struct e1000_vf_info    *vfdata;
 	struct e1000_filter_info filter;
 	bool stopped;
+	bool dma_noncoherent;	/**< device DMA is not coherent with the caches */
 	struct rte_timecounter  systime_tc;
 	struct rte_timecounter  rx_tstamp_tc;
 	struct rte_timecounter  tx_tstamp_tc;
@@ -427,6 +428,21 @@ int eth_igb_tx_queue_setup(struct rte_eth_dev *dev, uint16_t tx_queue_id,
 		const struct rte_eth_txconf *tx_conf);
 
 int eth_igb_tx_done_cleanup(void *txq, uint32_t free_cnt);
+
+void igb_dma_probe(struct rte_eth_dev *dev);
+
+void igb_dma_set_burst(struct rte_eth_dev *dev);
+
+#if defined(RTE_ARCH_ARM64)
+uint16_t eth_igb_recv_pkts_nc(void *rxq, struct rte_mbuf **rx_pkts,
+		uint16_t nb_pkts);
+
+uint16_t eth_igb_recv_scattered_pkts_nc(void *rxq, struct rte_mbuf **rx_pkts,
+		uint16_t nb_pkts);
+
+uint16_t eth_igb_xmit_pkts_nc(void *txq, struct rte_mbuf **tx_pkts,
+		uint16_t nb_pkts);
+#endif
 
 int eth_igb_rx_init(struct rte_eth_dev *dev);
 

@@ -809,8 +809,12 @@ eth_igb_dev_init(struct rte_eth_dev *eth_dev)
 	if (rte_eal_process_type() != RTE_PROC_PRIMARY){
 		if (eth_dev->data->scattered_rx)
 			eth_dev->rx_pkt_burst = &eth_igb_recv_scattered_pkts;
+		igb_dma_set_burst(eth_dev);
 		return 0;
 	}
+
+	igb_dma_probe(eth_dev);
+	igb_dma_set_burst(eth_dev);
 
 	rte_eth_copy_pci_info(eth_dev, pci_dev);
 

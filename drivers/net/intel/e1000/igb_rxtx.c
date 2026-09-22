@@ -35,6 +35,9 @@
 #include <rte_mbuf.h>
 #include <rte_ether.h>
 #include <ethdev_driver.h>
+#include <bus_pci_driver.h>
+#include <rte_bus_pci.h>
+#include <rte_mem_sync.h>
 #include <rte_prefetch.h>
 #include <rte_udp.h>
 #include <rte_tcp.h>
@@ -71,150 +74,52 @@
  * (DC CIVAC, as __dma_inv_area does) of descriptor status and received data
  * before reading what the NIC wrote.
  *
- * Cleaning a line writes the CPU's copy of the whole line back to RAM, so it
- * must never cover memory the NIC may still be writing: with 4 descriptors
- * per 64-byte line, flushing a freshly written descriptor also restored stale
- * status for its neighbours and erased the DD bits the NIC had just set (the
- * kernel avoids this by mapping rings non-cacheable).  Therefore, when DMA is
- * non-coherent:
- *  - TX completion is taken from the hardware head (TDH), not from DD bits;
- *  - RX buffer addresses are written back one whole cache line at a time,
- *    and only once every descriptor in that line has been handed back by the
- *    NIC and consumed.
- * All of this is a no-op on cache-coherent platforms and non-arm64 builds.
+ * Cleaning writes back a whole line, which holds four descriptors, so it can
+ * erase a DD bit the NIC just set: TX completion falls back to the newest
+ * posted descriptor, and RX addresses go back a line at a time.
  */
-#if defined(RTE_ARCH_ARM64)
-/* void igb_arm64_dcache_clean(uintptr_t start, uintptr_t end, uint64_t line) */
-void igb_arm64_dcache_clean(uintptr_t start, uintptr_t end, uint64_t line);
-/* void igb_arm64_dcache_inval(uintptr_t start, uintptr_t end, uint64_t line) */
-void igb_arm64_dcache_inval(uintptr_t start, uintptr_t end, uint64_t line);
-/* uint64_t igb_arm64_read_ctr(void) */
-uint64_t igb_arm64_read_ctr(void);
-__asm__(
-	"	.pushsection .text\n"
-	"	.p2align 2\n"
-	"	.globl igb_arm64_dcache_clean\n"
-	"	.hidden igb_arm64_dcache_clean\n"
-	"	.type igb_arm64_dcache_clean, %function\n"
-	"igb_arm64_dcache_clean:\n"
-	"	sub	x3, x2, #1\n"
-	"	bic	x0, x0, x3\n"
-	"1:	dc	cvac, x0\n"
-	"	add	x0, x0, x2\n"
-	"	cmp	x0, x1\n"
-	"	b.lo	1b\n"
-	"	ret\n"
-	"	.size igb_arm64_dcache_clean, .-igb_arm64_dcache_clean\n"
-	"	.globl igb_arm64_dcache_inval\n"
-	"	.hidden igb_arm64_dcache_inval\n"
-	"	.type igb_arm64_dcache_inval, %function\n"
-	"igb_arm64_dcache_inval:\n"
-	"	sub	x3, x2, #1\n"
-	"	bic	x0, x0, x3\n"
-	"1:	dc	civac, x0\n"
-	"	add	x0, x0, x2\n"
-	"	cmp	x0, x1\n"
-	"	b.lo	1b\n"
-	"	ret\n"
-	"	.size igb_arm64_dcache_inval, .-igb_arm64_dcache_inval\n"
-	"	.globl igb_arm64_read_ctr\n"
-	"	.hidden igb_arm64_read_ctr\n"
-	"	.type igb_arm64_read_ctr, %function\n"
-	"igb_arm64_read_ctr:\n"
-	"	mrs	x0, ctr_el0\n"
-	"	ret\n"
-	"	.size igb_arm64_read_ctr, .-igb_arm64_read_ctr\n"
-	"	.popsection\n");
-#endif
-
-#define IGB_DMA_NONCOHERENT_ENV "DPDK_DMA_NONCOHERENT"
-
-/* -1: not yet probed, 0: cache coherent, 1: needs explicit cache cleaning */
-static int igb_dma_noncoherent = -1;
-static uint64_t igb_dcache_line;
-
-/*
- * Linux only instantiates "of_node" links for devices described by a device
- * tree.  Walk the PCI device's sysfs ancestry (device -> bridges -> host
- * controller -> SoC bus) the way of_dma_is_coherent() walks DT parents, and
- * treat the device as non-coherent if it is DT-described and no ancestor
- * declares "dma-coherent".  ACPI and x86 systems have no of_node and are left
- * alone.
- */
-static void
-igb_probe_dma_coherence(const char *pci_name)
+void
+igb_dma_set_burst(struct rte_eth_dev *dev)
 {
-	const char *env = getenv(IGB_DMA_NONCOHERENT_ENV);
-	int noncoherent = 0;
+#if defined(RTE_ARCH_ARM64)
+	struct e1000_adapter *adapter = E1000_DEV_PRIVATE(dev->data->dev_private);
 
-	if (igb_dma_noncoherent >= 0)
+	if (!adapter->dma_noncoherent)
 		return;
-
-	if (env != NULL && env[0] != '\0') {
-		noncoherent = atoi(env) != 0;
-	} else {
-#if defined(RTE_ARCH_ARM64)
-		char path[PATH_MAX], real[PATH_MAX], probe[PATH_MAX];
-		bool dt_described = false, coherent = false;
-		char *slash;
-
-		if (snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s",
-				pci_name) < (int)sizeof(path) &&
-				realpath(path, real) != NULL) {
-			while ((slash = strrchr(real, '/')) != NULL &&
-					slash != real) {
-				if (snprintf(probe, sizeof(probe), "%s/of_node",
-						real) < (int)sizeof(probe) &&
-						access(probe, F_OK) == 0) {
-					dt_described = true;
-					if (snprintf(probe, sizeof(probe),
-							"%s/of_node/dma-coherent",
-							real) < (int)sizeof(probe) &&
-							access(probe, F_OK) == 0) {
-						coherent = true;
-						break;
-					}
-				}
-				*slash = '\0';
-			}
-		}
-		noncoherent = dt_described && !coherent;
+	if (dev->rx_pkt_burst == eth_igb_recv_pkts)
+		dev->rx_pkt_burst = eth_igb_recv_pkts_nc;
+	else if (dev->rx_pkt_burst == eth_igb_recv_scattered_pkts)
+		dev->rx_pkt_burst = eth_igb_recv_scattered_pkts_nc;
+	if (dev->tx_pkt_burst == eth_igb_xmit_pkts)
+		dev->tx_pkt_burst = eth_igb_xmit_pkts_nc;
 #else
-		RTE_SET_USED(pci_name);
+	RTE_SET_USED(dev);
 #endif
-	}
+}
 
+void
+igb_dma_probe(struct rte_eth_dev *dev)
+{
+	struct e1000_adapter *adapter = E1000_DEV_PRIVATE(dev->data->dev_private);
+	struct rte_pci_device *pci_dev = RTE_CLASS_TO_BUS_DEVICE(dev, *pci_dev);
+
+	adapter->dma_noncoherent = !rte_pci_dma_is_coherent(pci_dev);
+	if (!adapter->dma_noncoherent)
+		return;
 #if defined(RTE_ARCH_ARM64)
-	if (noncoherent) {
-		/* CTR_EL0.DCacheLine is log2 of the line size in words. */
-		igb_dcache_line = 4ULL << ((igb_arm64_read_ctr() >> 16) & 0xf);
-		PMD_INIT_LOG(NOTICE,
-			"%s: PCIe DMA is not cache coherent, cleaning %" PRIu64
-			"-byte D-cache lines before each DMA",
-			pci_name, igb_dcache_line);
-	}
-#else
-	if (noncoherent)
-		PMD_INIT_LOG(WARNING,
-			"%s: %s set, but cache cleaning is only implemented for arm64",
-			pci_name, IGB_DMA_NONCOHERENT_ENV);
-	noncoherent = 0;
+	/* CTR_EL0.DminLine is log2 of the line size in words. */
+	PMD_INIT_LOG(NOTICE, "%s: DMA is not cache coherent, maintaining %zu"
+		"-byte D-cache lines", dev->device->name,
+		rte_mem_dcache_line_size());
 #endif
-	igb_dma_noncoherent = noncoherent;
 }
 
 /* Make [addr, addr + len) visible to a bus-master read by the NIC. */
 static inline void
 igb_dma_sync_for_device(const volatile void *addr, size_t len)
 {
-#if defined(RTE_ARCH_ARM64)
-	if (unlikely(igb_dma_noncoherent > 0) && len != 0)
-		igb_arm64_dcache_clean((uintptr_t)addr, (uintptr_t)addr + len,
-				igb_dcache_line);
-#else
-	RTE_SET_USED(addr);
-	RTE_SET_USED(len);
-#endif
+	if (len != 0)
+		rte_mem_sync_for_device((const void *)(uintptr_t)addr, len);
 }
 
 /*
@@ -224,14 +129,16 @@ igb_dma_sync_for_device(const volatile void *addr, size_t len)
 static inline void
 igb_dma_sync_for_cpu(const volatile void *addr, size_t len)
 {
-#if defined(RTE_ARCH_ARM64)
-	if (unlikely(igb_dma_noncoherent > 0) && len != 0)
-		igb_arm64_dcache_inval((uintptr_t)addr, (uintptr_t)addr + len,
-				igb_dcache_line);
-#else
-	RTE_SET_USED(addr);
-	RTE_SET_USED(len);
-#endif
+	if (len != 0)
+		rte_mem_sync_for_cpu((const void *)(uintptr_t)addr, len);
+}
+
+/* EL0 has no invalidate-without-clean: write back dirty lines before handover. */
+static inline void
+igb_rx_buf_sync_for_device(struct rte_mbuf *mb)
+{
+	igb_dma_sync_for_device((char *)mb->buf_addr + RTE_PKTMBUF_HEADROOM,
+			mb->buf_len - RTE_PKTMBUF_HEADROOM);
 }
 
 /* Sync descriptors [from, to) of a ring of nb_desc entries, handling wrap. */
@@ -239,7 +146,7 @@ static inline void
 igb_dma_sync_ring(const volatile void *ring, size_t desc_size, uint16_t nb_desc,
 		uint16_t from, uint16_t to)
 {
-	if (likely(igb_dma_noncoherent <= 0) || from == to)
+	if (from == to)
 		return;
 	if (from < to) {
 		igb_dma_sync_for_device(RTE_PTR_ADD(ring, from * desc_size),
@@ -297,6 +204,7 @@ enum igb_rxq_flags {
  * Structure associated with each RX queue.
  */
 struct igb_rx_queue {
+	bool                   dma_noncoherent; /**< DMA needs cache maintenance */
 	struct rte_mempool  *mb_pool;   /**< mbuf pool to populate RX ring. */
 	volatile union e1000_adv_rx_desc *rx_ring; /**< RX ring virtual address. */
 	uint64_t            rx_ring_phys_addr; /**< RX ring DMA address. */
@@ -377,11 +285,12 @@ struct igb_advctx_info {
  * Structure associated with each TX queue.
  */
 struct igb_tx_queue {
+	bool                   dma_noncoherent; /**< DMA needs cache maintenance */
+	uint16_t               last_rs; /**< newest descriptor asking for status */
 	volatile union e1000_adv_tx_desc *tx_ring; /**< TX ring address */
 	uint64_t               tx_ring_phys_addr; /**< TX ring DMA address. */
 	struct igb_tx_entry    *sw_ring; /**< virtual address of SW ring. */
 	volatile uint32_t      *tdt_reg_addr; /**< Address of TDT register. */
-	volatile uint32_t      *tdh_reg_addr; /**< Address of TDH register. */
 	uint32_t               txd_type;      /**< Device-specific TXD type */
 	uint16_t               nb_tx_desc;    /**< number of TX descriptors. */
 	uint16_t               tx_tail; /**< Current value of TDT register. */
@@ -600,42 +509,35 @@ tx_desc_vlan_flags_to_cmdtype(uint64_t ol_flags)
 }
 
 /*
- * Non-coherent DMA: has the NIC completed descriptor desc?  The NIC owns the
- * circular range [TDH, tx_tail); everything else has been processed.  *head
- * caches one TDH read per burst (-1 = not read yet) and is refreshed once
- * before reporting a descriptor as still busy.
+ * A clean can erase a neighbour's Done bit, never invent one, and the NIC
+ * works in order: Done on the newest posted descriptor covers earlier ones.
  */
 static inline bool
-igb_tx_desc_done(struct igb_tx_queue *txq, uint16_t desc, int32_t *head)
+igb_tx_desc_done(struct igb_tx_queue *txq, uint16_t desc, const bool nc)
 {
-	uint16_t n = txq->nb_tx_desc;
-	int pass;
+	volatile uint32_t *status = &txq->tx_ring[desc].wb.status;
 
-	if (likely(igb_dma_noncoherent <= 0))
-		return (txq->tx_ring[desc].wb.status &
-			rte_cpu_to_le_32(E1000_TXD_STAT_DD)) != 0;
+	if (!nc)
+		return (*status & rte_cpu_to_le_32(E1000_TXD_STAT_DD)) != 0;
 
-	for (pass = 0; pass < 2; pass++) {
-		uint16_t owned, dist;
+	igb_dma_sync_for_cpu(status, sizeof(*status));
+	if (*status & rte_cpu_to_le_32(E1000_TXD_STAT_DD))
+		return true;
 
-		if (*head < 0 || pass > 0)
-			*head = rte_le_to_cpu_32(E1000_PCI_REG(txq->tdh_reg_addr)) % n;
-		owned = (uint16_t)((txq->tx_tail + n - *head) % n);
-		dist = (uint16_t)((desc + n - *head) % n);
-		if (dist >= owned)
-			return true;
-	}
-	return false;
+	status = &txq->tx_ring[txq->last_rs].wb.status;
+	igb_dma_sync_for_cpu(status, sizeof(*status));
+	return (*status & rte_cpu_to_le_32(E1000_TXD_STAT_DD)) != 0;
 }
 
 /* Descriptors covered by one D-cache line, or 0 if lines don't tile rings. */
 static inline uint16_t
 igb_rx_desc_per_line(struct igb_rx_queue *rxq)
 {
-	uint16_t per_line = igb_dcache_line / sizeof(*rxq->rx_ring);
+	size_t line = rte_mem_dcache_line_size();
+	uint16_t per_line = line / sizeof(*rxq->rx_ring);
 
 	if (per_line <= 1 || rxq->nb_rx_desc % per_line != 0 ||
-			((uintptr_t)rxq->rx_ring & (igb_dcache_line - 1)) != 0)
+			((uintptr_t)rxq->rx_ring & (line - 1)) != 0)
 		return 1;
 	return per_line;
 }
@@ -649,6 +551,7 @@ igb_rx_write_range(struct igb_rx_queue *rxq, uint16_t from, uint16_t to)
 	for (i = from; i < to; i++) {
 		volatile union e1000_adv_rx_desc *rxd = &rxq->rx_ring[i];
 
+		igb_rx_buf_sync_for_device(rxq->sw_ring[i].mbuf);
 		rxd->read.hdr_addr = 0;
 		rxd->read.pkt_addr = rte_cpu_to_le_64(
 			rte_mbuf_data_iova_default(rxq->sw_ring[i].mbuf));
@@ -683,9 +586,9 @@ igb_rx_flush_refills(struct igb_rx_queue *rxq, uint16_t rx_id)
 	return end;
 }
 
-uint16_t
-eth_igb_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
-	       uint16_t nb_pkts)
+static __rte_always_inline uint16_t
+igb_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts, uint16_t nb_pkts,
+	      const bool nc)
 {
 	struct igb_tx_queue *txq;
 	struct igb_tx_entry *sw_ring;
@@ -701,7 +604,6 @@ eth_igb_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
 	uint16_t slen;
 	uint64_t ol_flags;
 	uint16_t tx_end;
-	int32_t hw_head = -1;
 	uint16_t tx_id;
 	uint16_t tx_last;
 	uint16_t nb_tx;
@@ -808,7 +710,7 @@ eth_igb_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
 		/*
 		 * Check that this descriptor is free.
 		 */
-		if (!igb_tx_desc_done(txq, tx_end, &hw_head)) {
+		if (!igb_tx_desc_done(txq, tx_end, nc)) {
 			if (nb_tx == 0)
 				return 0;
 			goto end_of_tx;
@@ -895,8 +797,9 @@ eth_igb_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
 			 */
 			slen = (uint16_t) m_seg->data_len;
 			buf_dma_addr = rte_mbuf_data_iova(m_seg);
-			igb_dma_sync_for_device(rte_pktmbuf_mtod(m_seg, void *),
-					slen);
+			if (nc)
+				igb_dma_sync_for_device(
+					rte_pktmbuf_mtod(m_seg, void *), slen);
 			txd->read.buffer_addr =
 				rte_cpu_to_le_64(buf_dma_addr);
 			txd->read.cmd_type_len =
@@ -915,12 +818,14 @@ eth_igb_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
 		 */
 		txd->read.cmd_type_len |=
 			rte_cpu_to_le_32(E1000_TXD_CMD_EOP | E1000_TXD_CMD_RS);
+		txq->last_rs = tx_last;
 	}
  end_of_tx:
 	rte_wmb();
 
-	igb_dma_sync_ring(txq->tx_ring, sizeof(*txq->tx_ring), txq->nb_tx_desc,
-			txq->tx_tail, tx_id);
+	if (nc)
+		igb_dma_sync_ring(txq->tx_ring, sizeof(*txq->tx_ring),
+				txq->nb_tx_desc, txq->tx_tail, tx_id);
 
 	/*
 	 * Set the Transmit Descriptor Tail (TDT).
@@ -933,6 +838,20 @@ eth_igb_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
 
 	return nb_tx;
 }
+
+uint16_t
+eth_igb_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts, uint16_t nb_pkts)
+{
+	return igb_xmit_pkts(tx_queue, tx_pkts, nb_pkts, false);
+}
+
+#if defined(RTE_ARCH_ARM64)
+uint16_t
+eth_igb_xmit_pkts_nc(void *tx_queue, struct rte_mbuf **tx_pkts, uint16_t nb_pkts)
+{
+	return igb_xmit_pkts(tx_queue, tx_pkts, nb_pkts, true);
+}
+#endif
 
 /*********************************************************************
  *
@@ -1122,9 +1041,9 @@ rx_desc_error_to_pkt_flags(uint32_t rx_status)
 		E1000_RXD_ERR_CKSUM_BIT) & E1000_RXD_ERR_CKSUM_MSK];
 }
 
-uint16_t
-eth_igb_recv_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
-	       uint16_t nb_pkts)
+static __rte_always_inline uint16_t
+igb_recv_pkts(void *rx_queue, struct rte_mbuf **rx_pkts, uint16_t nb_pkts,
+	      const bool nc)
 {
 	struct igb_rx_queue *rxq;
 	volatile union e1000_adv_rx_desc *rx_ring;
@@ -1159,7 +1078,8 @@ eth_igb_recv_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 		 * using invalid descriptor fields when read from rxd.
 		 */
 		rxdp = &rx_ring[rx_id];
-		igb_dma_sync_for_cpu(rxdp, sizeof(*rxdp));
+		if (nc)
+			igb_dma_sync_for_cpu(rxdp, sizeof(*rxdp));
 		staterr = rxdp->wb.upper.status_error;
 		if (! (staterr & rte_cpu_to_le_32(E1000_RXD_STAT_DD)))
 			break;
@@ -1229,8 +1149,7 @@ eth_igb_recv_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 		rxe->mbuf = nmb;
 		dma_addr =
 			rte_cpu_to_le_64(rte_mbuf_data_iova_default(nmb));
-		/* Non-coherent DMA defers this to igb_rx_flush_refills(). */
-		if (likely(igb_dma_noncoherent <= 0)) {
+		if (!nc) {	/* deferred to igb_rx_flush_refills() */
 			rxdp->read.hdr_addr = 0;
 			rxdp->read.pkt_addr = dma_addr;
 		}
@@ -1251,8 +1170,9 @@ eth_igb_recv_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 		pkt_len = (uint16_t) (rte_le_to_cpu_16(rxd.wb.upper.length) -
 				      rxq->crc_len);
 		rxm->data_off = RTE_PKTMBUF_HEADROOM;
-		igb_dma_sync_for_cpu((char *)rxm->buf_addr + rxm->data_off,
-				rte_le_to_cpu_16(rxd.wb.upper.length));
+		if (nc)
+			igb_dma_sync_for_cpu((char *)rxm->buf_addr + rxm->data_off,
+					rte_le_to_cpu_16(rxd.wb.upper.length));
 		rte_packet_prefetch((char *)rxm->buf_addr + rxm->data_off);
 		rxm->nb_segs = 1;
 		rxm->next = NULL;
@@ -1304,7 +1224,7 @@ eth_igb_recv_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 			   (unsigned) rxq->port_id, (unsigned) rxq->queue_id,
 			   (unsigned) rx_id, (unsigned) nb_hold,
 			   (unsigned) nb_rx);
-		if (unlikely(igb_dma_noncoherent > 0))
+		if (nc)
 			rx_id = igb_rx_flush_refills(rxq, rx_id);
 		rx_id = (uint16_t) ((rx_id == 0) ?
 				     (rxq->nb_rx_desc - 1) : (rx_id - 1));
@@ -1316,8 +1236,22 @@ eth_igb_recv_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 }
 
 uint16_t
-eth_igb_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
-			 uint16_t nb_pkts)
+eth_igb_recv_pkts(void *rx_queue, struct rte_mbuf **rx_pkts, uint16_t nb_pkts)
+{
+	return igb_recv_pkts(rx_queue, rx_pkts, nb_pkts, false);
+}
+
+#if defined(RTE_ARCH_ARM64)
+uint16_t
+eth_igb_recv_pkts_nc(void *rx_queue, struct rte_mbuf **rx_pkts, uint16_t nb_pkts)
+{
+	return igb_recv_pkts(rx_queue, rx_pkts, nb_pkts, true);
+}
+#endif
+
+static __rte_always_inline uint16_t
+igb_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
+			uint16_t nb_pkts, const bool nc)
 {
 	struct igb_rx_queue *rxq;
 	volatile union e1000_adv_rx_desc *rx_ring;
@@ -1362,7 +1296,8 @@ eth_igb_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 		 * using invalid descriptor fields when read from rxd.
 		 */
 		rxdp = &rx_ring[rx_id];
-		igb_dma_sync_for_cpu(rxdp, sizeof(*rxdp));
+		if (nc)
+			igb_dma_sync_for_cpu(rxdp, sizeof(*rxdp));
 		staterr = rxdp->wb.upper.status_error;
 		if (! (staterr & rte_cpu_to_le_32(E1000_RXD_STAT_DD)))
 			break;
@@ -1431,8 +1366,7 @@ eth_igb_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 		rxm = rxe->mbuf;
 		rxe->mbuf = nmb;
 		dma = rte_cpu_to_le_64(rte_mbuf_data_iova_default(nmb));
-		/* Non-coherent DMA defers this to igb_rx_flush_refills(). */
-		if (likely(igb_dma_noncoherent <= 0)) {
+		if (!nc) {	/* deferred to igb_rx_flush_refills() */
 			rxdp->read.pkt_addr = dma;
 			rxdp->read.hdr_addr = 0;
 		}
@@ -1443,8 +1377,9 @@ eth_igb_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 		data_len = rte_le_to_cpu_16(rxd.wb.upper.length);
 		rxm->data_len = data_len;
 		rxm->data_off = RTE_PKTMBUF_HEADROOM;
-		igb_dma_sync_for_cpu((char *)rxm->buf_addr + rxm->data_off,
-				data_len);
+		if (nc)
+			igb_dma_sync_for_cpu((char *)rxm->buf_addr + rxm->data_off,
+					data_len);
 
 		/*
 		 * If this is the first buffer of the received packet,
@@ -1574,7 +1509,7 @@ eth_igb_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 			   (unsigned) rxq->port_id, (unsigned) rxq->queue_id,
 			   (unsigned) rx_id, (unsigned) nb_hold,
 			   (unsigned) nb_rx);
-		if (unlikely(igb_dma_noncoherent > 0))
+		if (nc)
 			rx_id = igb_rx_flush_refills(rxq, rx_id);
 		rx_id = (uint16_t) ((rx_id == 0) ?
 				     (rxq->nb_rx_desc - 1) : (rx_id - 1));
@@ -1584,6 +1519,22 @@ eth_igb_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 	rxq->nb_rx_hold = nb_hold;
 	return nb_rx;
 }
+
+uint16_t
+eth_igb_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
+			    uint16_t nb_pkts)
+{
+	return igb_recv_scattered_pkts(rx_queue, rx_pkts, nb_pkts, false);
+}
+
+#if defined(RTE_ARCH_ARM64)
+uint16_t
+eth_igb_recv_scattered_pkts_nc(void *rx_queue, struct rte_mbuf **rx_pkts,
+			       uint16_t nb_pkts)
+{
+	return igb_recv_scattered_pkts(rx_queue, rx_pkts, nb_pkts, true);
+}
+#endif
 
 /*
  * Maximum number of Ring Descriptors.
@@ -1633,7 +1584,6 @@ igb_tx_done_cleanup(struct igb_tx_queue *txq, uint32_t free_cnt)
 	uint16_t tx_id;    /* Current segment being processed. */
 	uint16_t tx_last;  /* Last segment in the current packet. */
 	uint16_t tx_next;  /* First segment of the next packet. */
-	int32_t hw_head = -1;
 	int count = 0;
 
 	if (!txq)
@@ -1665,7 +1615,7 @@ igb_tx_done_cleanup(struct igb_tx_queue *txq, uint32_t free_cnt)
 		tx_last = sw_ring[tx_id].last_id;
 
 		if (sw_ring[tx_last].mbuf) {
-			if (igb_tx_desc_done(txq, tx_last, &hw_head)) {
+			if (igb_tx_desc_done(txq, tx_last, txq->dma_noncoherent)) {
 				/* Increment the number of packets
 				 * freed.
 				 */
@@ -1829,7 +1779,6 @@ eth_igb_tx_queue_setup(struct rte_eth_dev *dev,
 	offloads = tx_conf->offloads | dev->data->dev_conf.txmode.offloads;
 
 	hw = E1000_DEV_PRIVATE_TO_HW(dev->data->dev_private);
-	igb_probe_dma_coherence(dev->device->name);
 
 	/*
 	 * Validate number of transmit descriptors.
@@ -1893,9 +1842,9 @@ eth_igb_tx_queue_setup(struct rte_eth_dev *dev,
 	txq->reg_idx = (uint16_t)((RTE_ETH_DEV_SRIOV(dev).active == 0) ?
 		queue_idx : RTE_ETH_DEV_SRIOV(dev).def_pool_q_idx + queue_idx);
 	txq->port_id = dev->data->port_id;
+	txq->dma_noncoherent = E1000_DEV_PRIVATE(dev->data->dev_private)->dma_noncoherent;
 
 	txq->tdt_reg_addr = E1000_PCI_REG_ADDR(hw, E1000_TDT(txq->reg_idx));
-	txq->tdh_reg_addr = E1000_PCI_REG_ADDR(hw, E1000_TDH(txq->reg_idx));
 	txq->tx_ring_phys_addr = tz->iova;
 
 	txq->tx_ring = (union e1000_adv_tx_desc *) tz->addr;
@@ -1912,6 +1861,7 @@ eth_igb_tx_queue_setup(struct rte_eth_dev *dev,
 
 	igb_reset_tx_queue(txq, dev);
 	dev->tx_pkt_burst = eth_igb_xmit_pkts;
+	igb_dma_set_burst(dev);
 	dev->tx_pkt_prepare = &eth_igb_prep_pkts;
 	dev->data->tx_queues[queue_idx] = txq;
 	txq->offloads = offloads;
@@ -2032,7 +1982,6 @@ eth_igb_rx_queue_setup(struct rte_eth_dev *dev,
 	offloads = rx_conf->offloads | dev->data->dev_conf.rxmode.offloads;
 
 	hw = E1000_DEV_PRIVATE_TO_HW(dev->data->dev_private);
-	igb_probe_dma_coherence(dev->device->name);
 
 	/*
 	 * Validate number of receive descriptors.
@@ -2071,6 +2020,7 @@ eth_igb_rx_queue_setup(struct rte_eth_dev *dev,
 	rxq->reg_idx = (uint16_t)((RTE_ETH_DEV_SRIOV(dev).active == 0) ?
 		queue_idx : RTE_ETH_DEV_SRIOV(dev).def_pool_q_idx + queue_idx);
 	rxq->port_id = dev->data->port_id;
+	rxq->dma_noncoherent = E1000_DEV_PRIVATE(dev->data->dev_private)->dma_noncoherent;
 	if (dev->data->dev_conf.rxmode.offloads & RTE_ETH_RX_OFFLOAD_KEEP_CRC)
 		rxq->crc_len = RTE_ETHER_CRC_LEN;
 	else
@@ -2124,7 +2074,8 @@ eth_igb_rx_queue_count(void *rx_queue)
 	rxdp = &(rxq->rx_ring[rxq->rx_tail]);
 
 	while ((desc < rxq->nb_rx_desc) &&
-		(igb_dma_sync_for_cpu(rxdp, sizeof(*rxdp)),
+		(rxq->dma_noncoherent ?
+			igb_dma_sync_for_cpu(rxdp, sizeof(*rxdp)) : (void)0,
 		 rxdp->wb.upper.status_error & E1000_RXD_STAT_DD)) {
 		desc += IGB_RXQ_SCAN_INTERVAL;
 		rxdp += IGB_RXQ_SCAN_INTERVAL;
@@ -2154,7 +2105,8 @@ eth_igb_rx_descriptor_status(void *rx_queue, uint16_t offset)
 		desc -= rxq->nb_rx_desc;
 
 	status = &rxq->rx_ring[desc].wb.upper.status_error;
-	igb_dma_sync_for_cpu(status, sizeof(*status));
+	if (rxq->dma_noncoherent)
+		igb_dma_sync_for_cpu(status, sizeof(*status));
 	if (*status & rte_cpu_to_le_32(E1000_RXD_STAT_DD))
 		return RTE_ETH_RX_DESC_DONE;
 
@@ -2165,7 +2117,6 @@ int
 eth_igb_tx_descriptor_status(void *tx_queue, uint16_t offset)
 {
 	struct igb_tx_queue *txq = tx_queue;
-	volatile uint32_t *status;
 	uint32_t desc;
 
 	if (unlikely(offset >= txq->nb_tx_desc))
@@ -2175,16 +2126,8 @@ eth_igb_tx_descriptor_status(void *tx_queue, uint16_t offset)
 	if (desc >= txq->nb_tx_desc)
 		desc -= txq->nb_tx_desc;
 
-	status = &txq->tx_ring[desc].wb.status;
-	if (unlikely(igb_dma_noncoherent > 0)) {
-		int32_t hw_head = -1;
-
-		RTE_SET_USED(status);
-		if (igb_tx_desc_done(txq, desc, &hw_head))
-			return RTE_ETH_TX_DESC_DONE;
-	} else if (*status & rte_cpu_to_le_32(E1000_TXD_STAT_DD)) {
+	if (igb_tx_desc_done(txq, desc, txq->dma_noncoherent))
 		return RTE_ETH_TX_DESC_DONE;
-	}
 
 	return RTE_ETH_TX_DESC_FULL;
 }
@@ -2603,13 +2546,16 @@ igb_alloc_rx_queue_mbufs(struct igb_rx_queue *rxq)
 		}
 		dma_addr =
 			rte_cpu_to_le_64(rte_mbuf_data_iova_default(mbuf));
+		if (rxq->dma_noncoherent)
+			igb_rx_buf_sync_for_device(mbuf);
 		rxd = &rxq->rx_ring[i];
 		rxd->read.hdr_addr = 0;
 		rxd->read.pkt_addr = dma_addr;
 		rxe[i].mbuf = mbuf;
 	}
-	igb_dma_sync_for_device(rxq->rx_ring,
-			rxq->nb_rx_desc * sizeof(*rxq->rx_ring));
+	if (rxq->dma_noncoherent)
+		igb_dma_sync_for_device(rxq->rx_ring,
+				rxq->nb_rx_desc * sizeof(*rxq->rx_ring));
 
 	return 0;
 }
@@ -2917,6 +2863,7 @@ eth_igb_rx_init(struct rte_eth_dev *dev)
 		E1000_WRITE_REG(hw, E1000_RDH(rxq->reg_idx), 0);
 		E1000_WRITE_REG(hw, E1000_RDT(rxq->reg_idx), rxq->nb_rx_desc - 1);
 	}
+	igb_dma_set_burst(dev);
 
 	return 0;
 }
@@ -3127,6 +3074,7 @@ eth_igbvf_rx_init(struct rte_eth_dev *dev)
 		E1000_WRITE_REG(hw, E1000_RDH(i), 0);
 		E1000_WRITE_REG(hw, E1000_RDT(i), rxq->nb_rx_desc - 1);
 	}
+	igb_dma_set_burst(dev);
 
 	return 0;
 }
