@@ -135,6 +135,9 @@ bool eal_mmu_supported(void);
  * @return
  *   0 on success, negative on error
  */
+/** Resolve the physical-to-device address offset, once, before memory init. */
+void eal_iova_pa_offset_init(void);
+
 int rte_eal_memseg_init(void);
 
 /**

@@ -85,40 +85,8 @@ uint64_t eal_get_baseaddr(void)
 #endif
 }
 
-/*
- * On some platforms the address space seen by PCIe devices is not the CPU
- * physical address space: the host bridge applies a fixed translation to
- * inbound (device-to-memory) traffic.  There, an IOVA in RTE_IOVA_PA mode is
- * *not* a CPU physical address -- a device DMAing to CPU physical address P
- * must be programmed with P + offset, or its reads and writes fall outside the
- * bridge's inbound window and are silently discarded.
- *
- * This was found on a Broadcom BCM2711 (Raspberry Pi Compute Module 4, 4GB),
- * whose host bridge node pcie@7d500000 declares in "dma-ranges" that CPU
- * physical 0 is reached by devices at PCIe address 0x4_0000_0000 (its outbound
- * window, in "ranges", starts at PCIe address 0xc000_0000).  Without the
- * translation every DPDK descriptor ring and mbuf address handed to the NIC is
- * unreachable, and the observed symptom was a device that reported link up and
- * counted packets in its own registers while never completing a single DMA.
- *
- * The translation is read from the "dma-ranges" property of the PCI host
- * bridge in the device tree, so each platform gets the value it declares
- * rather than one assumed here.  It is zero on identity-mapped platforms and
- * absent where there is no device tree (x86), and everything below is then a
- * no-op.
- */
 #define DT_ROOT_PATH		"/proc/device-tree"
-#define IOVA_PA_OFFSET_ENV	"DPDK_IOVA_PA_OFFSET"
-#define IOVA_PA_OFFSET_UNSET	UINT64_MAX
 #define DT_MAX_SCAN_DEPTH	4
-
-/*
- * Cached PCIe-bus-address-minus-CPU-physical-address translation.  Written at
- * most once with a value that does not depend on who computes it, and it is a
- * single aligned 64-bit store, so the benign race between threads racing to
- * fill it in cannot produce a torn or inconsistent result.
- */
-static uint64_t iova_pa_offset = IOVA_PA_OFFSET_UNSET;
 
 /* Read a device-tree property into buf, storing its length in *outlen. */
 static int
@@ -299,46 +267,36 @@ eal_iova_pa_offset(void)
 {
 	char node[PATH_MAX] = "";
 	uint64_t offset = 0;
-	const char *env;
-	char *end;
 
-	if (iova_pa_offset != IOVA_PA_OFFSET_UNSET)
-		return iova_pa_offset;
+	if (dt_scan_pci_dma_offset(DT_ROOT_PATH, NULL, 0, &offset, node,
+			sizeof(node)) != 0)
+		return 0;
 
-	env = getenv(IOVA_PA_OFFSET_ENV);
-	if (env != NULL && env[0] != '\0') {
-		errno = 0;
-		offset = strtoull(env, &end, 0);
-		if (errno != 0 || *end != '\0') {
-			EAL_LOG(ERR, "Invalid %s value '%s', assuming no offset",
-				IOVA_PA_OFFSET_ENV, env);
-			offset = 0;
-		} else {
-			EAL_LOG(NOTICE,
-				"Using IOVA offset 0x%" PRIx64 " from %s",
-				offset, IOVA_PA_OFFSET_ENV);
-		}
-	} else if (dt_scan_pci_dma_offset(DT_ROOT_PATH, NULL, 0, &offset,
-			node, sizeof(node)) == 0) {
-		EAL_LOG(NOTICE,
-			"PCIe bus addresses are offset by 0x%" PRIx64
-			" from CPU physical addresses (%s/dma-ranges); applying it to IOVAs",
-			offset, node);
-	} else {
-		offset = 0;
-	}
-
-	iova_pa_offset = offset;
+	EAL_LOG(NOTICE,
+		"PCIe bus addresses are offset by 0x%" PRIx64
+		" from CPU physical addresses (%s/dma-ranges); applying it to IOVAs",
+		offset, node);
 	return offset;
 }
 
-/* Convert a CPU physical address into the IOVA a device must be given. */
+/* Keep what a bus reported, else scan.  Secondaries inherit via mem_config. */
+void
+eal_iova_pa_offset_init(void)
+{
+	struct rte_mem_config *mcfg = rte_eal_get_configuration()->mem_config;
+
+	if (rte_eal_process_type() != RTE_PROC_PRIMARY ||
+			mcfg->iova_pa_offset != 0)
+		return;
+	mcfg->iova_pa_offset = eal_iova_pa_offset();
+}
+
 static rte_iova_t
 eal_pa_to_iova(phys_addr_t pa)
 {
 	if (pa == RTE_BAD_IOVA)
 		return RTE_BAD_IOVA;
-	return pa + eal_iova_pa_offset();
+	return pa + rte_eal_get_configuration()->mem_config->iova_pa_offset;
 }
 
 /*
