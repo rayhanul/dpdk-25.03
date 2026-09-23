@@ -1,5 +1,5 @@
-.. SPDX-License-Identifier: BSD-3-Clause
-   Copyright(c) 2026 Md Rayhanul Islam
+..  SPDX-License-Identifier: BSD-3-Clause
+    Copyright(c) 2026 Md Rayhanul Islam
 
 Running DPDK on Broadcom BCM2711 platforms
 ==========================================
@@ -21,18 +21,19 @@ physical addresses.  On a Compute Module 4 the host bridge node declares::
 which places CPU physical address 0 at PCIe bus address ``0x4_0000_0000``.
 
 In ``RTE_IOVA_PA`` mode, an IOVA must therefore be the CPU physical
-address plus that offset.  EAL reads the translation from the host
-bridge's ``dma-ranges`` property and applies it.  Platforms that declare
-no translation, and platforms without a device tree, are unaffected.
+address plus that offset.  The PCI bus reads ``dma-ranges`` from the host
+bridge above each device and reports the translation to EAL, which adds
+it to every IOVA.  Platforms that declare no translation, and platforms
+without a device tree, are unaffected.
 
-A DPDK application logs the offset it found at startup::
+The offset is logged once at startup::
 
-   EAL: PCIe bus addresses are offset by 0x400000000 from CPU physical
-   addresses (/proc/device-tree/scb/pcie@7d500000/dma-ranges); applying
-   it to IOVAs
+   EAL: Device addresses are offset by 0x400000000 from physical addresses
+   (/sys/firmware/devicetree/base/scb/pcie@7d500000)
 
-The value can be overridden with the ``DPDK_IOVA_PA_OFFSET`` environment
-variable, given in hexadecimal.  Without the translation, a device
+Only one translation can be in force, because IOVAs are a single address
+space: if a second bridge declares a different offset, EAL reports the
+conflict and initialization fails.  Without the translation, a device
 reports link up and counts packets in its own registers while never
 completing a DMA.
 
@@ -44,23 +45,26 @@ its ancestors declares ``dma-coherent``.  A device therefore does not see
 data the CPU has only written to its caches, and the CPU does not see
 data the device has written to memory.
 
-The ``e1000`` (igb) driver handles this when it detects a
-device-tree-described device with no ``dma-coherent`` ancestor, on arm64.
-It cleans the data cache over descriptors and packet data before the tail
-register is written, and invalidates it before reading what the device
-wrote.  Because a cache line covers four descriptors, TX completion is
-taken from the hardware head register rather than the DD bits, and RX
-descriptors are refilled one whole cache line at a time.
+The PCI bus reports this per device through ``rte_pci_dma_is_coherent()``,
+and EAL provides the cache maintenance in ``rte_mem_sync.h``.  A driver
+that does nothing about it will move corrupt data.
+
+The ``e1000`` driver handles it in ``igb``, which installs separate burst
+functions at probe so that coherent platforms keep the paths they had.  They write descriptors and packet data back to memory before the
+tail register is written, and invalidate them before reading what the
+device wrote.  Because one 64-byte cache line covers four descriptors,
+TX completion is taken from the DD bits with the last requested
+descriptor as the in-order fallback, and an RX buffer is written back
+before it is handed to the hardware again.
 
 This is logged at device probe::
 
-   E1000_INIT: 0000:01:00.0: PCIe DMA is not cache coherent,
-   cleaning 64-byte D-cache lines before each DMA
+   E1000_INIT: 0000:01:00.0: DMA is not cache coherent,
+   maintaining 64-byte D-cache lines
 
-It can be forced on or off with ``DPDK_DMA_NONCOHERENT=1`` or ``0``.
-
-Other drivers running on this platform need equivalent handling; only
-``e1000`` implements it today.
+``em`` does not implement the maintenance and refuses to probe such a
+device rather than corrupt traffic.  Other drivers running on this
+platform need equivalent handling.
 
 Recommended settings
 --------------------

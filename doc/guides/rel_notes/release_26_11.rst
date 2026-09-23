@@ -57,19 +57,25 @@ New Features
 
 * **Added PCIe inbound DMA address translation on Linux.**
 
-  EAL now reads the PCIe host bridge "dma-ranges" property from the device
-  tree and applies the translation it declares to IOVAs, so devices on a
-  platform whose inbound window is not identity-mapped, such as the
-  Broadcom BCM2711 on Raspberry Pi 4 and Compute Module 4, can reach
-  system memory.
+  The PCI bus now reads the "dma-ranges" property of the host bridge above
+  a device and reports the translation it declares to EAL, which applies it
+  to IOVAs.  Devices on a platform whose inbound window is not identity
+  mapped, such as the Broadcom BCM2711 on Raspberry Pi 4 and Compute
+  Module 4, can now reach system memory.
 
-* **Added non-coherent DMA support to the e1000 (igb) driver.**
+* **Added cache maintenance helpers for non-coherent DMA.**
 
-  The driver now performs the cache maintenance required on a PCIe bus
-  that is not cache coherent, taking TX completion from the hardware head
-  register and refilling RX descriptors a cache line at a time.  It is
-  enabled when the device is described by a device tree whose bus does not
-  declare "dma-coherent", on arm64.
+  ``rte_mem_sync_for_device()`` and ``rte_mem_sync_for_cpu()`` write back
+  and invalidate the data cache over a buffer, for drivers on a bus that
+  is not cache coherent.  ``rte_pci_dma_is_coherent()`` reports whether a
+  PCI device needs them.
+
+* **Updated e1000 driver.**
+
+  * Added non-coherent DMA support to ``igb``, through burst functions
+    selected at probe so that coherent platforms are unaffected.
+  * ``em`` now refuses to probe a device whose DMA is not coherent,
+    instead of moving corrupt data.
 
 
 Removed Items

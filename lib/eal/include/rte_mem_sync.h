@@ -9,10 +9,8 @@
  * @file
  *
  * Cache maintenance for devices whose DMA is not coherent with the CPU
- * caches, in the shape the kernel DMA APIs use: the owner of a buffer hands
- * it over before the other side touches it.  Drivers call these only for
- * devices the bus reports as non-coherent; on every other platform they are
- * empty.
+ * caches: the owner of a buffer hands it over before the other side touches
+ * it, as the kernel DMA APIs do.  Empty on coherent platforms.
  */
 
 #include <stddef.h>
@@ -25,8 +23,7 @@ extern "C" {
 #endif
 
 /**
- * Size of a data cache line on this CPU, for callers that must group work by
- * line rather than write back memory the device may be writing.
+ * Size of a data cache line on this CPU, for callers that group work by line.
  */
 static inline size_t
 rte_mem_dcache_line_size(void)
@@ -44,10 +41,7 @@ rte_mem_dcache_line_size(void)
 
 #ifdef RTE_ARCH_ARM64
 
-/*
- * Step by the smallest line any implementation may have: a larger real line
- * is still cleaned whole, only with redundant operations.
- */
+/* Step by the smallest possible line; a larger one is still cleaned whole. */
 static inline void
 rte_mem_sync_for_device(const void *addr, size_t len)
 {
@@ -59,7 +53,7 @@ rte_mem_sync_for_device(const void *addr, size_t len)
 	asm volatile("dsb sy" : : : "memory");
 }
 
-/* EL0 has no invalidate-without-clean, so this also writes back dirty lines. */
+/* EL0 cannot invalidate without cleaning, so dirty lines are written back. */
 static inline void
 rte_mem_sync_for_cpu(const void *addr, size_t len)
 {

@@ -88,7 +88,7 @@ uint64_t eal_get_baseaddr(void)
 #define DT_ROOT_PATH		"/proc/device-tree"
 #define DT_MAX_SCAN_DEPTH	4
 
-/* Read a device-tree property into buf, storing its length in *outlen. */
+/* Read a device-tree property, with its length in *outlen. */
 static int
 dt_read_prop(const char *dir, const char *prop, void *buf, size_t buflen,
 		size_t *outlen)
@@ -112,7 +112,7 @@ dt_read_prop(const char *dir, const char *prop, void *buf, size_t buflen,
 	return 0;
 }
 
-/* Read a single-cell device-tree property, e.g. #address-cells. */
+/* Read a one-cell property, e.g. #address-cells. */
 static int
 dt_read_u32(const char *dir, const char *prop, uint32_t *out)
 {
@@ -139,11 +139,9 @@ dt_read_cells(const uint32_t *cells, uint32_t n)
 }
 
 /*
- * Derive the inbound translation from the "dma-ranges" of one PCI host bridge.
- * Each entry is <pci-address> <parent-address> <size>, where a PCI address is
- * always 3 cells (phys.hi holds flags, phys.mid/phys.lo hold the address), the
- * parent address is the parent bus' #address-cells, and the size is this node's
- * #size-cells.
+ * Read the inbound translation from a host bridge's "dma-ranges".  An entry is
+ * <pci-address> <parent-address> <size>: 3 cells, then the parent's
+ * #address-cells, then this node's #size-cells.
  */
 static int
 dt_pci_dma_offset(const char *node, const char *parent, uint64_t *offset)
@@ -184,11 +182,7 @@ dt_pci_dma_offset(const char *node, const char *parent, uint64_t *offset)
 			off = entry_off;
 			first = false;
 		} else if (entry_off != off) {
-			/*
-			 * The bridge translates different regions differently,
-			 * which a single offset cannot express.  Refuse to
-			 * guess rather than corrupt every IOVA.
-			 */
+			/* A single offset cannot express this; do not guess. */
 			EAL_LOG(WARNING,
 				"%s: non-uniform dma-ranges, cannot derive an IOVA offset",
 				node);
@@ -201,11 +195,9 @@ dt_pci_dma_offset(const char *node, const char *parent, uint64_t *offset)
 }
 
 /*
- * Walk the device tree looking for a PCI host bridge that describes a non-zero
- * inbound translation, and report the first one found.  Systems with several
- * host bridges translating differently would need per-device IOVAs, which the
- * IOVA-as-PA model cannot express; we log the node we used so a mismatch is
- * visible rather than silent.
+ * Fallback for a bus that reported nothing: the first host bridge in the tree
+ * that declares a translation.  The node used is logged, since IOVA-as-PA has
+ * no way to express several bridges translating differently.
  */
 static int
 dt_scan_pci_dma_offset(const char *dir, const char *parent, int depth,
@@ -259,9 +251,7 @@ dt_scan_pci_dma_offset(const char *dir, const char *parent, int depth,
 	return ret;
 }
 
-/* Offset to add to a CPU physical address to obtain the address a PCIe device
- * must use to reach it.  Zero on identity-mapped platforms.
- */
+/* Added to a CPU physical address to reach it from a PCIe device. */
 static uint64_t
 eal_iova_pa_offset(void)
 {

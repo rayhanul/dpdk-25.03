@@ -119,7 +119,7 @@ rte_iova_t rte_mem_virt2iova(const void *virt);
 
 /**
  * @internal
- * Declare the translation a bus applies to inbound DMA.  DPDK has one IOVA
+ * Declare the translation a bus applies to inbound DMA.  There is one IOVA
  * space, so buses that disagree cannot be used together.
  *
  * @param offset

@@ -176,7 +176,7 @@ int rte_pci_pasid_set_state(const struct rte_pci_device *dev,
  * @internal
  * Whether this device's DMA is coherent with the CPU caches.  A device
  * described by a device tree is not, unless it or a parent declares
- * "dma-coherent"; everything else is.
+ * "dma-coherent".
  *
  * @param dev
  *   The PCI device.

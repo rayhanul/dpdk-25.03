@@ -50,33 +50,12 @@
 #include "e1000_ethdev.h"
 
 /*
- * Non-cache-coherent DMA support.
- *
- * When the PCIe host bridge is not cache coherent -- no "dma-coherent" on the
- * device tree bus -- a bus-master read by the NIC can observe stale memory:
- * data the CPU has just stored is not yet visible to the device.  The Linux
- * DMA API hides this by cleaning the CPU data cache over a buffer before
- * handing it to the device (arch_sync_dma_for_device), but DPDK writes
- * descriptors and packet data straight into hugepage memory and rings the
- * doorbell immediately.
- *
- * This was developed and tested on one such platform: a BCM2711 (Raspberry Pi
- * Compute Module 4, 4GB, Cortex-A72, 64-byte D-cache lines) with an Intel I210
- * on uio_pci_generic.  There the NIC fetched the previous contents of the
- * rings -- zeroed descriptors with DD set and null buffer addresses -- so
- * transmits never completed and received data was DMA'd to address zero.
- * Cleaning only to the point of unification (DC CVAU) did not help; the NIC
- * saw the CPU's stores only after a clean to the point of coherency.
- *
- * Mirror the kernel: clean the D-cache to the point of coherency (DC CVAC, as
- * arm64 __dma_clean_area does) over every descriptor and packet buffer before
- * the tail register tells the NIC it may read them, and discard cached copies
- * (DC CIVAC, as __dma_inv_area does) of descriptor status and received data
- * before reading what the NIC wrote.
- *
- * Cleaning writes back a whole line, which holds four descriptors, so it can
- * erase a DD bit the NIC just set: TX completion falls back to the newest
- * posted descriptor, and RX addresses go back a line at a time.
+ * On a bus that is not cache coherent the NIC reads stale descriptors and
+ * packet data, so both are written back before the tail register is rung, and
+ * invalidated before the CPU reads what the NIC wrote.  One cache line holds
+ * four descriptors, so writing a line back can erase a neighbour's Done bit:
+ * transmits fall back to the newest posted descriptor, and receive buffers go
+ * back to the NIC a whole line at a time.
  */
 void
 igb_dma_set_burst(struct rte_eth_dev *dev)
@@ -107,14 +86,13 @@ igb_dma_probe(struct rte_eth_dev *dev)
 	if (!adapter->dma_noncoherent)
 		return;
 #if defined(RTE_ARCH_ARM64)
-	/* CTR_EL0.DminLine is log2 of the line size in words. */
 	PMD_INIT_LOG(NOTICE, "%s: DMA is not cache coherent, maintaining %zu"
 		"-byte D-cache lines", dev->device->name,
 		rte_mem_dcache_line_size());
 #endif
 }
 
-/* Make [addr, addr + len) visible to a bus-master read by the NIC. */
+/* Make [addr, addr + len) visible to the NIC. */
 static inline void
 igb_dma_sync_for_device(const volatile void *addr, size_t len)
 {
@@ -122,10 +100,7 @@ igb_dma_sync_for_device(const volatile void *addr, size_t len)
 		rte_mem_sync_for_device((const void *)(uintptr_t)addr, len);
 }
 
-/*
- * Make memory the NIC has written visible to the CPU: discard any cached copy
- * (DC CIVAC, as arm64 __dma_inv_area does) so the next read comes from RAM.
- */
+/* Make what the NIC wrote visible to the CPU. */
 static inline void
 igb_dma_sync_for_cpu(const volatile void *addr, size_t len)
 {
@@ -133,7 +108,7 @@ igb_dma_sync_for_cpu(const volatile void *addr, size_t len)
 		rte_mem_sync_for_cpu((const void *)(uintptr_t)addr, len);
 }
 
-/* EL0 has no invalidate-without-clean: write back dirty lines before handover. */
+/* EL0 cannot invalidate without cleaning, so a dirty line must go back first. */
 static inline void
 igb_rx_buf_sync_for_device(struct rte_mbuf *mb)
 {
@@ -141,7 +116,7 @@ igb_rx_buf_sync_for_device(struct rte_mbuf *mb)
 			mb->buf_len - RTE_PKTMBUF_HEADROOM);
 }
 
-/* Sync descriptors [from, to) of a ring of nb_desc entries, handling wrap. */
+/* Sync descriptors [from, to), handling wrap. */
 static inline void
 igb_dma_sync_ring(const volatile void *ring, size_t desc_size, uint16_t nb_desc,
 		uint16_t from, uint16_t to)
@@ -215,11 +190,7 @@ struct igb_rx_queue {
 	struct rte_mbuf *pkt_last_seg;  /**< Last segment of current packet. */
 	uint16_t            nb_rx_desc; /**< number of RX descriptors. */
 	uint16_t            rx_tail;    /**< current value of RDT register. */
-	/**
-	 * Non-coherent DMA only: first consumed descriptor whose refilled
-	 * buffer address has not been written back to the ring yet.
-	 */
-	uint16_t            rx_unwritten;
+	uint16_t            rx_unwritten; /**< first refill not written back. */
 	uint16_t            nb_rx_hold; /**< number of held free RX desc. */
 	uint16_t            rx_free_thresh; /**< max free RX desc to hold. */
 	uint16_t            queue_id;   /**< RX queue index. */
@@ -529,7 +500,7 @@ igb_tx_desc_done(struct igb_tx_queue *txq, uint16_t desc, const bool nc)
 	return (*status & rte_cpu_to_le_32(E1000_TXD_STAT_DD)) != 0;
 }
 
-/* Descriptors covered by one D-cache line, or 0 if lines don't tile rings. */
+/* Descriptors per D-cache line, or 0 if a line does not tile the ring. */
 static inline uint16_t
 igb_rx_desc_per_line(struct igb_rx_queue *rxq)
 {
@@ -542,7 +513,7 @@ igb_rx_desc_per_line(struct igb_rx_queue *rxq)
 	return per_line;
 }
 
-/* Write refilled buffer addresses for descriptors [from, to) and flush them. */
+/* Write the refilled buffer addresses for [from, to) and flush them. */
 static inline void
 igb_rx_write_range(struct igb_rx_queue *rxq, uint16_t from, uint16_t to)
 {
@@ -550,21 +521,19 @@ igb_rx_write_range(struct igb_rx_queue *rxq, uint16_t from, uint16_t to)
 
 	for (i = from; i < to; i++) {
 		volatile union e1000_adv_rx_desc *rxd = &rxq->rx_ring[i];
+		struct rte_mbuf *mb = rxq->sw_ring[i].mbuf;
 
-		igb_rx_buf_sync_for_device(rxq->sw_ring[i].mbuf);
+		igb_rx_buf_sync_for_device(mb);
 		rxd->read.hdr_addr = 0;
-		rxd->read.pkt_addr = rte_cpu_to_le_64(
-			rte_mbuf_data_iova_default(rxq->sw_ring[i].mbuf));
+		rxd->read.pkt_addr = rte_cpu_to_le_64(rte_mbuf_data_iova_default(mb));
 	}
 	igb_dma_sync_for_device(&rxq->rx_ring[from],
 			(to - from) * sizeof(*rxq->rx_ring));
 }
 
 /*
- * Non-coherent DMA: write back every whole cache line of descriptors that
- * lies entirely before the software head rx_id, i.e. that the NIC has
- * finished with.  Returns the first descriptor still unwritten, which bounds
- * how far RDT may advance.
+ * Write back the whole cache lines of descriptors the NIC has finished with,
+ * and return the first one still unwritten, which bounds how far RDT may go.
  */
 static inline uint16_t
 igb_rx_flush_refills(struct igb_rx_queue *rxq, uint16_t rx_id)
@@ -798,8 +767,7 @@ igb_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts, uint16_t nb_pkts,
 			slen = (uint16_t) m_seg->data_len;
 			buf_dma_addr = rte_mbuf_data_iova(m_seg);
 			if (nc)
-				igb_dma_sync_for_device(
-					rte_pktmbuf_mtod(m_seg, void *), slen);
+				igb_dma_sync_for_device(rte_pktmbuf_mtod(m_seg, void *), slen);
 			txd->read.buffer_addr =
 				rte_cpu_to_le_64(buf_dma_addr);
 			txd->read.cmd_type_len =
@@ -2073,10 +2041,11 @@ eth_igb_rx_queue_count(void *rx_queue)
 	rxq = rx_queue;
 	rxdp = &(rxq->rx_ring[rxq->rx_tail]);
 
-	while ((desc < rxq->nb_rx_desc) &&
-		(rxq->dma_noncoherent ?
-			igb_dma_sync_for_cpu(rxdp, sizeof(*rxdp)) : (void)0,
-		 rxdp->wb.upper.status_error & E1000_RXD_STAT_DD)) {
+	while (desc < rxq->nb_rx_desc) {
+		if (rxq->dma_noncoherent)
+			igb_dma_sync_for_cpu(rxdp, sizeof(*rxdp));
+		if ((rxdp->wb.upper.status_error & E1000_RXD_STAT_DD) == 0)
+			break;
 		desc += IGB_RXQ_SCAN_INTERVAL;
 		rxdp += IGB_RXQ_SCAN_INTERVAL;
 		if (rxq->rx_tail + desc >= rxq->nb_rx_desc)

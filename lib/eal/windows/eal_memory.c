@@ -657,7 +657,7 @@ rte_mem_lock(const void *virt, size_t size)
 	return 0;
 }
 
-/* No inbound DMA translation is known on this platform. */
+/* No inbound DMA translation on this platform. */
 void
 eal_iova_pa_offset_init(void)
 {
