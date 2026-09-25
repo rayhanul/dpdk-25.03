@@ -118,22 +118,6 @@ phys_addr_t rte_mem_virt2phy(const void *virt);
 rte_iova_t rte_mem_virt2iova(const void *virt);
 
 /**
- * @internal
- * Declare the translation a bus applies to inbound DMA.  There is one IOVA
- * space, so buses that disagree cannot be used together.
- *
- * @param offset
- *   Offset in bytes, zero for an identity mapping.
- * @param source
- *   Where the value came from, for the log message.
- * @return
- *   0 on success, negative if a different offset is already in use.
- */
-__rte_internal
-int
-rte_mem_set_iova_pa_offset(uint64_t offset, const char *source);
-
-/**
  * Get virtual memory address corresponding to iova address.
  *
  * @note This function read-locks the memory hotplug subsystem, and thus cannot

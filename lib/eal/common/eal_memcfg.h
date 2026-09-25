@@ -83,9 +83,6 @@ struct rte_mem_config {
 
 	uint8_t dma_maskbits; /**< Keeps the more restricted dma mask. */
 
-	uint64_t iova_pa_offset;
-	/**< Added to a physical address to reach it from a device. */
-
 	size_t max_memzone; /**< Maximum number of allocated memzones. */
 };
 

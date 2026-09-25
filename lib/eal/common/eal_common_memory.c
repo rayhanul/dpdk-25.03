@@ -694,33 +694,6 @@ rte_eal_memdevice_init(void)
 	return 0;
 }
 
-/* Record the translation a bus applies to inbound DMA. */
-RTE_EXPORT_INTERNAL_SYMBOL(rte_mem_set_iova_pa_offset)
-int
-rte_mem_set_iova_pa_offset(uint64_t offset, const char *source)
-{
-	struct rte_mem_config *mcfg = rte_eal_get_configuration()->mem_config;
-
-	if (rte_eal_process_type() != RTE_PROC_PRIMARY)
-		return 0;	/* inherited through the shared config */
-
-	if (mcfg->iova_pa_offset == offset)
-		return 0;
-	if (mcfg->iova_pa_offset != 0) {
-		EAL_LOG(ERR,
-			"%s needs IOVA offset 0x%" PRIx64 ", but 0x%" PRIx64
-			" is already in use; devices behind bridges that translate"
-			" differently cannot share one IOVA space",
-			source, offset, mcfg->iova_pa_offset);
-		return -1;
-	}
-	mcfg->iova_pa_offset = offset;
-	EAL_LOG(NOTICE,
-		"Device addresses are offset by 0x%" PRIx64
-		" from physical addresses (%s)", offset, source);
-	return 0;
-}
-
 /* Lock page in physical memory and prevent from swapping. */
 RTE_EXPORT_SYMBOL(rte_mem_lock_page)
 int
@@ -1168,8 +1141,6 @@ rte_eal_memory_init(void)
 	int retval;
 
 	EAL_LOG(DEBUG, "Setting up physically contiguous memory...");
-
-	eal_iova_pa_offset_init();
 
 	if (rte_eal_memseg_init() < 0)
 		goto fail;

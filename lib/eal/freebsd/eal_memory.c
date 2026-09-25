@@ -440,12 +440,6 @@ memseg_secondary_init(void)
 	return 0;
 }
 
-/* No inbound DMA translation on this platform. */
-void
-eal_iova_pa_offset_init(void)
-{
-}
-
 int
 rte_eal_memseg_init(void)
 {

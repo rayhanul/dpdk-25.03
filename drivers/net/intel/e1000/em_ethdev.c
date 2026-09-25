@@ -370,12 +370,6 @@ eth_em_dev_init(struct rte_eth_dev *eth_dev)
 		return 0;
 	}
 
-	if (!rte_pci_dma_is_coherent(pci_dev)) {
-		PMD_INIT_LOG(ERR, "%s: DMA is not coherent with the CPU caches, "
-			"which this driver does not handle", pci_dev->device.name);
-		return -ENOTSUP;
-	}
-
 	rte_eth_copy_pci_info(eth_dev, pci_dev);
 
 	hw->hw_addr = (void *)pci_dev->mem_resource[0].addr;

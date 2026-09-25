@@ -20,4 +20,3 @@ Getting Started Guide for Linux
     enable_func
     nic_perf_intel_platform
     amd_platform
-    bcm2711_platform

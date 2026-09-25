@@ -813,7 +813,9 @@ eth_igb_dev_init(struct rte_eth_dev *eth_dev)
 		return 0;
 	}
 
-	igb_dma_probe(eth_dev);
+	error = igb_dma_probe(eth_dev);
+	if (error != 0)
+		return error;
 	igb_dma_set_burst(eth_dev);
 
 	rte_eth_copy_pci_info(eth_dev, pci_dev);
@@ -1101,7 +1103,8 @@ static int eth_igb_pci_remove(struct rte_pci_device *pci_dev)
 
 static struct rte_pci_driver rte_igb_pmd = {
 	.id_table = pci_id_igb_map,
-	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_INTR_LSC,
+	.drv_flags = RTE_PCI_DRV_NEED_MAPPING | RTE_PCI_DRV_INTR_LSC |
+		RTE_PCI_DRV_DMA_NONCOHERENT,
 	.probe = eth_igb_pci_probe,
 	.remove = eth_igb_pci_remove,
 };

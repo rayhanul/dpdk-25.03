@@ -3,7 +3,6 @@
  * Copyright(c) 2013 6WIND S.A.
  */
 
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
@@ -26,7 +25,6 @@
 #include <numaif.h>
 #endif
 
-#include <rte_byteorder.h>
 #include <rte_errno.h>
 #include <rte_log.h>
 #include <rte_memory.h>
@@ -83,210 +81,6 @@ uint64_t eal_get_baseaddr(void)
 #else
 	return 0x100000000ULL;
 #endif
-}
-
-#define DT_ROOT_PATH		"/proc/device-tree"
-#define DT_MAX_SCAN_DEPTH	4
-
-/* Read a device-tree property, with its length in *outlen. */
-static int
-dt_read_prop(const char *dir, const char *prop, void *buf, size_t buflen,
-		size_t *outlen)
-{
-	char path[PATH_MAX];
-	size_t n;
-	FILE *f;
-
-	if (snprintf(path, sizeof(path), "%s/%s", dir, prop) >= (int)sizeof(path))
-		return -1;
-	f = fopen(path, "rb");
-	if (f == NULL)
-		return -1;
-	n = fread(buf, 1, buflen, f);
-	if (ferror(f)) {
-		fclose(f);
-		return -1;
-	}
-	fclose(f);
-	*outlen = n;
-	return 0;
-}
-
-/* Read a one-cell property, e.g. #address-cells. */
-static int
-dt_read_u32(const char *dir, const char *prop, uint32_t *out)
-{
-	uint32_t val;
-	size_t len;
-
-	if (dt_read_prop(dir, prop, &val, sizeof(val), &len) < 0 ||
-			len != sizeof(val))
-		return -1;
-	*out = rte_be_to_cpu_32(val);
-	return 0;
-}
-
-/* Device-tree addresses are big-endian sequences of 32-bit cells. */
-static uint64_t
-dt_read_cells(const uint32_t *cells, uint32_t n)
-{
-	uint64_t val = 0;
-	uint32_t i;
-
-	for (i = 0; i < n; i++)
-		val = (val << 32) | rte_be_to_cpu_32(cells[i]);
-	return val;
-}
-
-/*
- * Read the inbound translation from a host bridge's "dma-ranges".  An entry is
- * <pci-address> <parent-address> <size>: 3 cells, then the parent's
- * #address-cells, then this node's #size-cells.
- */
-static int
-dt_pci_dma_offset(const char *node, const char *parent, uint64_t *offset)
-{
-	uint32_t cells[256];
-	uint32_t parent_ac, size_c;
-	size_t len, ncells, per_entry, i;
-	uint64_t off = 0;
-	bool first = true;
-
-	if (dt_read_prop(node, "dma-ranges", cells, sizeof(cells), &len) < 0)
-		return -1;
-
-	/* An empty "dma-ranges" declares the bus to be identity mapped. */
-	if (len == 0) {
-		*offset = 0;
-		return 0;
-	}
-
-	if (dt_read_u32(parent, "#address-cells", &parent_ac) < 0 ||
-			dt_read_u32(node, "#size-cells", &size_c) < 0)
-		return -1;
-	/* More than 2 cells cannot be held in a uint64_t. */
-	if (parent_ac == 0 || parent_ac > 2 || size_c > 2)
-		return -1;
-
-	per_entry = 3 + parent_ac + size_c;
-	ncells = len / sizeof(uint32_t);
-	if (ncells == 0 || ncells % per_entry != 0)
-		return -1;
-
-	for (i = 0; i < ncells; i += per_entry) {
-		uint64_t pci_addr = dt_read_cells(&cells[i + 1], 2);
-		uint64_t cpu_addr = dt_read_cells(&cells[i + 3], parent_ac);
-		uint64_t entry_off = pci_addr - cpu_addr;
-
-		if (first) {
-			off = entry_off;
-			first = false;
-		} else if (entry_off != off) {
-			/* A single offset cannot express this; do not guess. */
-			EAL_LOG(WARNING,
-				"%s: non-uniform dma-ranges, cannot derive an IOVA offset",
-				node);
-			return -1;
-		}
-	}
-
-	*offset = off;
-	return 0;
-}
-
-/*
- * Fallback for a bus that reported nothing: the first host bridge in the tree
- * that declares a translation.  The node used is logged, since IOVA-as-PA has
- * no way to express several bridges translating differently.
- */
-static int
-dt_scan_pci_dma_offset(const char *dir, const char *parent, int depth,
-		uint64_t *offset, char *node, size_t node_len)
-{
-	struct dirent *ent;
-	int ret = -1;
-	DIR *d;
-
-	if (depth > DT_MAX_SCAN_DEPTH)
-		return -1;
-
-	if (parent != NULL) {
-		char type[16];
-		size_t len;
-
-		if (dt_read_prop(dir, "device_type", type, sizeof(type) - 1,
-				&len) == 0) {
-			type[len] = '\0';
-			if (strcmp(type, "pci") == 0 &&
-					dt_pci_dma_offset(dir, parent,
-						offset) == 0 && *offset != 0) {
-				strlcpy(node, dir, node_len);
-				return 0;
-			}
-		}
-	}
-
-	d = opendir(dir);
-	if (d == NULL)
-		return -1;
-	while ((ent = readdir(d)) != NULL) {
-		char child[PATH_MAX];
-
-		/* Skip ".", "..", and the device tree's own dot-properties. */
-		if (ent->d_name[0] == '.')
-			continue;
-		/* procfs may not fill in d_type; opendir() filters non-dirs. */
-		if (ent->d_type != DT_DIR && ent->d_type != DT_UNKNOWN)
-			continue;
-		if (snprintf(child, sizeof(child), "%s/%s", dir,
-				ent->d_name) >= (int)sizeof(child))
-			continue;
-		if (dt_scan_pci_dma_offset(child, dir, depth + 1, offset,
-				node, node_len) == 0) {
-			ret = 0;
-			break;
-		}
-	}
-	closedir(d);
-	return ret;
-}
-
-/* Added to a CPU physical address to reach it from a PCIe device. */
-static uint64_t
-eal_iova_pa_offset(void)
-{
-	char node[PATH_MAX] = "";
-	uint64_t offset = 0;
-
-	if (dt_scan_pci_dma_offset(DT_ROOT_PATH, NULL, 0, &offset, node,
-			sizeof(node)) != 0)
-		return 0;
-
-	EAL_LOG(NOTICE,
-		"PCIe bus addresses are offset by 0x%" PRIx64
-		" from CPU physical addresses (%s/dma-ranges); applying it to IOVAs",
-		offset, node);
-	return offset;
-}
-
-/* Keep what a bus reported, else scan.  Secondaries inherit via mem_config. */
-void
-eal_iova_pa_offset_init(void)
-{
-	struct rte_mem_config *mcfg = rte_eal_get_configuration()->mem_config;
-
-	if (rte_eal_process_type() != RTE_PROC_PRIMARY ||
-			mcfg->iova_pa_offset != 0)
-		return;
-	mcfg->iova_pa_offset = eal_iova_pa_offset();
-}
-
-static rte_iova_t
-eal_pa_to_iova(phys_addr_t pa)
-{
-	if (pa == RTE_BAD_IOVA)
-		return RTE_BAD_IOVA;
-	return pa + rte_eal_get_configuration()->mem_config->iova_pa_offset;
 }
 
 /*
@@ -356,7 +150,7 @@ rte_mem_virt2iova(const void *virtaddr)
 {
 	if (rte_eal_iova_mode() == RTE_IOVA_VA)
 		return (uintptr_t)virtaddr;
-	return eal_pa_to_iova(rte_mem_virt2phy(virtaddr));
+	return rte_mem_virt2phy(virtaddr);
 }
 
 /*
@@ -1011,10 +805,7 @@ remap_segment(struct hugepage_file *hugepages, int seg_start, int seg_end)
 		ms->addr = addr;
 		ms->hugepage_sz = page_sz;
 		ms->len = memseg_len;
-		/* In IOVA-as-VA mode physaddr has been rewritten to the VA. */
-		ms->iova = rte_eal_iova_mode() == RTE_IOVA_VA ?
-				hfile->physaddr :
-				eal_pa_to_iova(hfile->physaddr);
+		ms->iova = hfile->physaddr;
 		ms->socket_id = hfile->socket_id;
 		ms->nchannel = rte_memory_get_nchannel();
 		ms->nrank = rte_memory_get_nrank();

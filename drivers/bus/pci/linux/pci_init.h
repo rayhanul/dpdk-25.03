@@ -73,7 +73,7 @@ int pci_vfio_unmap_resource(struct rte_pci_device *dev);
 
 int pci_vfio_is_enabled(void);
 
-/* Report this device's inbound DMA translation, read from its host bridge. */
-int pci_dt_set_dma_offset(const char *dirname);
+/* Record the DMA properties of the bridge above this device. */
+void pci_dt_read_dma_info(struct rte_pci_device *dev, const char *dirname);
 
 #endif /* EAL_PCI_INIT_H_ */

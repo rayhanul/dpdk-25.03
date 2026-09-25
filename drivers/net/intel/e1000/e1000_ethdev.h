@@ -11,6 +11,8 @@
 #include <rte_flow.h>
 #include <rte_time.h>
 #include <rte_pci.h>
+#include <rte_bus_pci.h>
+#include <rte_mem_sync.h>
 
 #define E1000_INTEL_VENDOR_ID 0x8086
 
@@ -283,7 +285,8 @@ struct e1000_adapter {
 	struct e1000_vf_info    *vfdata;
 	struct e1000_filter_info filter;
 	bool stopped;
-	bool dma_noncoherent;	/**< device DMA is not coherent with the caches */
+	struct rte_pci_dma_info dma;	/**< DMA window of the bridge above. */
+	bool dma_active;		/**< translate and maintain caches. */
 	struct rte_timecounter  systime_tc;
 	struct rte_timecounter  rx_tstamp_tc;
 	struct rte_timecounter  tx_tstamp_tc;
@@ -429,7 +432,7 @@ int eth_igb_tx_queue_setup(struct rte_eth_dev *dev, uint16_t tx_queue_id,
 
 int eth_igb_tx_done_cleanup(void *txq, uint32_t free_cnt);
 
-void igb_dma_probe(struct rte_eth_dev *dev);
+int igb_dma_probe(struct rte_eth_dev *dev);
 
 void igb_dma_set_burst(struct rte_eth_dev *dev);
 

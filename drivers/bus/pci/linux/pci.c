@@ -220,10 +220,7 @@ pci_scan_one(const char *dirname, const struct rte_pci_addr *addr)
 	dev = &pdev->device;
 	dev->addr = *addr;
 
-	if (pci_dt_set_dma_offset(dirname) < 0) {
-		pci_free(pdev);
-		return -1;
-	}
+	pci_dt_read_dma_info(dev, dirname);
 
 	/* get vendor id */
 	snprintf(filename, sizeof(filename), "%s/vendor", dirname);
@@ -340,6 +337,7 @@ pci_scan_one(const char *dirname, const struct rte_pci_addr *addr)
 				rte_bus_insert_device(&rte_pci_bus, &dev2->device, &dev->device);
 			} else { /* already registered */
 				if (!rte_dev_is_probed(&dev2->device)) {
+					RTE_PCI_DEVICE_INTERNAL(dev2)->dma = pdev->dma;
 					dev2->kdrv = dev->kdrv;
 					dev2->max_vfs = dev->max_vfs;
 					dev2->id = dev->id;
@@ -595,6 +593,10 @@ pci_device_iova_mode(const struct rte_pci_driver *pdrv,
 		     const struct rte_pci_device *pdev)
 {
 	enum rte_iova_mode iova_mode = RTE_IOVA_DC;
+
+	/* The bridge translates physical addresses, so IOVAs must be those. */
+	if (RTE_PCI_DEVICE_INTERNAL_CONST(pdev)->dma.size != 0)
+		return RTE_IOVA_PA;
 
 	switch (pdev->kdrv) {
 	case RTE_PCI_KDRV_VFIO: {

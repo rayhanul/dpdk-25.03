@@ -174,17 +174,65 @@ int rte_pci_pasid_set_state(const struct rte_pci_device *dev,
 
 /**
  * @internal
- * Whether this device's DMA is coherent with the CPU caches.  A device
- * described by a device tree is not, unless it or a parent declares
- * "dma-coherent".
+ * What the host bridge above a device says about its DMA: the window it
+ * translates into, and whether the traffic is coherent with the CPU caches.
+ * A zero size means the identity mapping every other platform uses.
+ */
+struct rte_pci_dma_info {
+	uint64_t cpu_base;	/**< start of the window, CPU side. */
+	uint64_t bus_base;	/**< the same address as the device sees it. */
+	uint64_t size;		/**< window length, 0 if not translated. */
+	bool noncoherent;	/**< the CPU caches need maintaining by hand. */
+	bool unusable;		/**< properties this bus cannot honour. */
+};
+
+/**
+ * @internal
+ * Copy a device's DMA properties into driver-owned storage.  A driver that
+ * supports secondary processes saves them in its shared data during the
+ * primary's probe, since the bus context is not shared.
  *
  * @param dev
  *   The PCI device.
- * @return
- *   True if no cache maintenance is needed around DMA.
+ * @param info
+ *   Filled in with the properties of the bridge above it.
  */
 __rte_internal
-bool rte_pci_dma_is_coherent(const struct rte_pci_device *dev);
+void rte_pci_get_dma_info(const struct rte_pci_device *dev,
+		struct rte_pci_dma_info *info);
+
+/**
+ * @internal
+ * Translate an IOVA range into an address the device can reach, or
+ * RTE_BAD_IOVA if it falls outside the window.  Addresses outside a
+ * translated window are unreachable, so a driver must check every one.
+ *
+ * @param info
+ *   The device's DMA properties.
+ * @param iova
+ *   The address as EAL knows it.
+ * @param len
+ *   Length of the range, which must fit in the window as well.
+ * @return
+ *   The device-side address, or RTE_BAD_IOVA.
+ */
+static inline rte_iova_t
+rte_pci_dma_iova(const struct rte_pci_dma_info *info, rte_iova_t iova,
+		size_t len)
+{
+	uint64_t offset;
+
+	if (iova == RTE_BAD_IOVA || len == 0)
+		return RTE_BAD_IOVA;
+	if (info->size == 0)
+		return iova;
+	if (iova < info->cpu_base)
+		return RTE_BAD_IOVA;
+	offset = iova - info->cpu_base;
+	if (offset >= info->size || len > info->size - offset)
+		return RTE_BAD_IOVA;
+	return info->bus_base + offset;
+}
 
 /**
  * Read PCI config space.

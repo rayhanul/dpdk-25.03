@@ -52,10 +52,10 @@
 /*
  * On a bus that is not cache coherent the NIC reads stale descriptors and
  * packet data, so both are written back before the tail register is rung, and
- * invalidated before the CPU reads what the NIC wrote.  One cache line holds
- * four descriptors, so writing a line back can erase a neighbour's Done bit:
- * transmits fall back to the newest posted descriptor, and receive buffers go
- * back to the NIC a whole line at a time.
+ * invalidated before the CPU reads what the NIC wrote.  Such a bridge also
+ * translates addresses, so every address handed to the NIC goes through the
+ * device's DMA window first.  A cache line holds four descriptors, which is
+ * why neither side ever writes a line the other still owns.
  */
 void
 igb_dma_set_burst(struct rte_eth_dev *dev)
@@ -63,7 +63,7 @@ igb_dma_set_burst(struct rte_eth_dev *dev)
 #if defined(RTE_ARCH_ARM64)
 	struct e1000_adapter *adapter = E1000_DEV_PRIVATE(dev->data->dev_private);
 
-	if (!adapter->dma_noncoherent)
+	if (!adapter->dma_active)
 		return;
 	if (dev->rx_pkt_burst == eth_igb_recv_pkts)
 		dev->rx_pkt_burst = eth_igb_recv_pkts_nc;
@@ -76,28 +76,35 @@ igb_dma_set_burst(struct rte_eth_dev *dev)
 #endif
 }
 
-void
+int
 igb_dma_probe(struct rte_eth_dev *dev)
 {
 	struct e1000_adapter *adapter = E1000_DEV_PRIVATE(dev->data->dev_private);
 	struct rte_pci_device *pci_dev = RTE_CLASS_TO_BUS_DEVICE(dev, *pci_dev);
 
-	adapter->dma_noncoherent = !rte_pci_dma_is_coherent(pci_dev);
-	if (!adapter->dma_noncoherent)
-		return;
-#if defined(RTE_ARCH_ARM64)
+	rte_pci_get_dma_info(pci_dev, &adapter->dma);
+	adapter->dma_active = adapter->dma.noncoherent || adapter->dma.size != 0;
+	if (!adapter->dma_active)
+		return 0;
+	if (!rte_mem_sync_supported() || rte_mem_dcache_line_size() !=
+			4 * sizeof(union e1000_adv_rx_desc)) {
+		PMD_INIT_LOG(ERR, "%s: this DMA handling needs 64-byte cache lines",
+			dev->device->name);
+		return -ENOTSUP;
+	}
 	PMD_INIT_LOG(NOTICE, "%s: DMA is not cache coherent, maintaining %zu"
 		"-byte D-cache lines", dev->device->name,
 		rte_mem_dcache_line_size());
-#endif
+	return 0;
 }
 
 /* Make [addr, addr + len) visible to the NIC. */
 static inline void
-igb_dma_sync_for_device(const volatile void *addr, size_t len)
+igb_dma_sync_for_device(const volatile void *addr, size_t len,
+		enum rte_mem_sync_direction dir)
 {
 	if (len != 0)
-		rte_mem_sync_for_device((const void *)(uintptr_t)addr, len);
+		rte_mem_sync_for_device((const void *)(uintptr_t)addr, len, dir);
 }
 
 /* Make what the NIC wrote visible to the CPU. */
@@ -105,15 +112,34 @@ static inline void
 igb_dma_sync_for_cpu(const volatile void *addr, size_t len)
 {
 	if (len != 0)
-		rte_mem_sync_for_cpu((const void *)(uintptr_t)addr, len);
+		rte_mem_sync_for_cpu((const void *)(uintptr_t)addr, len,
+				RTE_MEM_SYNC_FROM_DEVICE);
 }
 
-/* EL0 cannot invalidate without cleaning, so a dirty line must go back first. */
+/* The NIC writes into this buffer next, so clean it as well as invalidate. */
 static inline void
 igb_rx_buf_sync_for_device(struct rte_mbuf *mb)
 {
 	igb_dma_sync_for_device((char *)mb->buf_addr + RTE_PKTMBUF_HEADROOM,
-			mb->buf_len - RTE_PKTMBUF_HEADROOM);
+			mb->buf_len - RTE_PKTMBUF_HEADROOM,
+			RTE_MEM_SYNC_FROM_DEVICE);
+}
+
+/* A buffer the NIC may fill must be reachable and own its cache lines. */
+static inline bool
+igb_rx_buf_usable(const struct rte_pci_dma_info *dma, struct rte_mbuf *mb)
+{
+	size_t line = rte_mem_dcache_line_size();
+	uintptr_t addr = (uintptr_t)mb->buf_addr + RTE_PKTMBUF_HEADROOM;
+	size_t len;
+
+	if (!RTE_MBUF_DIRECT(mb) || RTE_MBUF_HAS_EXTBUF(mb) ||
+			mb->buf_len <= RTE_PKTMBUF_HEADROOM)
+		return false;
+	len = mb->buf_len - RTE_PKTMBUF_HEADROOM;
+	return (addr % line) == 0 && (len % line) == 0 &&
+		rte_pci_dma_iova(dma, rte_mbuf_data_iova_default(mb), len) !=
+			RTE_BAD_IOVA;
 }
 
 /* Sync descriptors [from, to), handling wrap. */
@@ -125,11 +151,11 @@ igb_dma_sync_ring(const volatile void *ring, size_t desc_size, uint16_t nb_desc,
 		return;
 	if (from < to) {
 		igb_dma_sync_for_device(RTE_PTR_ADD(ring, from * desc_size),
-				(to - from) * desc_size);
+				(to - from) * desc_size, RTE_MEM_SYNC_TO_DEVICE);
 	} else {
 		igb_dma_sync_for_device(RTE_PTR_ADD(ring, from * desc_size),
-				(nb_desc - from) * desc_size);
-		igb_dma_sync_for_device(ring, to * desc_size);
+				(nb_desc - from) * desc_size, RTE_MEM_SYNC_TO_DEVICE);
+		igb_dma_sync_for_device(ring, to * desc_size, RTE_MEM_SYNC_TO_DEVICE);
 	}
 }
 
@@ -179,7 +205,9 @@ enum igb_rxq_flags {
  * Structure associated with each RX queue.
  */
 struct igb_rx_queue {
-	bool                   dma_noncoherent; /**< DMA needs cache maintenance */
+	struct rte_pci_dma_info dma;    /**< translation window of the bridge. */
+	bool                   dma_active; /**< translate and maintain caches. */
+	uint16_t               dma_per_line; /**< descriptors in one cache line. */
 	struct rte_mempool  *mb_pool;   /**< mbuf pool to populate RX ring. */
 	volatile union e1000_adv_rx_desc *rx_ring; /**< RX ring virtual address. */
 	uint64_t            rx_ring_phys_addr; /**< RX ring DMA address. */
@@ -256,8 +284,10 @@ struct igb_advctx_info {
  * Structure associated with each TX queue.
  */
 struct igb_tx_queue {
-	bool                   dma_noncoherent; /**< DMA needs cache maintenance */
-	uint16_t               last_rs; /**< newest descriptor asking for status */
+	struct rte_pci_dma_info dma;    /**< translation window of the bridge. */
+	bool                   dma_active; /**< translate and maintain caches. */
+	uint16_t               dma_per_line; /**< descriptors in one cache line. */
+	uint16_t               last_rs; /**< newest descriptor asking for status. */
 	volatile union e1000_adv_tx_desc *tx_ring; /**< TX ring address */
 	uint64_t               tx_ring_phys_addr; /**< TX ring DMA address. */
 	struct igb_tx_entry    *sw_ring; /**< virtual address of SW ring. */
@@ -480,8 +510,10 @@ tx_desc_vlan_flags_to_cmdtype(uint64_t ol_flags)
 }
 
 /*
- * A clean can erase a neighbour's Done bit, never invent one, and the NIC
- * works in order: Done on the newest posted descriptor covers earlier ones.
+ * Cleaning a line writes back the CPU's copy of its neighbours, which can
+ * erase a Done bit the NIC had just set.  That loses a completion but never
+ * invents one, and the NIC works through the ring in order, so a Done bit on
+ * the newest descriptor that asked for status covers everything before it.
  */
 static inline bool
 igb_tx_desc_done(struct igb_tx_queue *txq, uint16_t desc, const bool nc)
@@ -500,17 +532,24 @@ igb_tx_desc_done(struct igb_tx_queue *txq, uint16_t desc, const bool nc)
 	return (*status & rte_cpu_to_le_32(E1000_TXD_STAT_DD)) != 0;
 }
 
-/* Descriptors per D-cache line, or 0 if a line does not tile the ring. */
+/* Every segment has to fall inside the window before any of it is posted. */
+static bool
+igb_tx_pkt_reachable(struct igb_tx_queue *txq, struct rte_mbuf *mb)
+{
+	uint16_t n = 0, expected = mb->nb_segs;
+
+	for (; mb != NULL && n < txq->nb_tx_desc; mb = mb->next, n++)
+		if (rte_pci_dma_iova(&txq->dma, rte_mbuf_data_iova(mb),
+				mb->data_len) == RTE_BAD_IOVA)
+			return false;
+	return mb == NULL && n == expected;
+}
+
+/* Descriptors per D-cache line, or 1 if a line does not tile the ring. */
 static inline uint16_t
 igb_rx_desc_per_line(struct igb_rx_queue *rxq)
 {
-	size_t line = rte_mem_dcache_line_size();
-	uint16_t per_line = line / sizeof(*rxq->rx_ring);
-
-	if (per_line <= 1 || rxq->nb_rx_desc % per_line != 0 ||
-			((uintptr_t)rxq->rx_ring & (line - 1)) != 0)
-		return 1;
-	return per_line;
+	return rxq->dma_per_line;
 }
 
 /* Write the refilled buffer addresses for [from, to) and flush them. */
@@ -525,10 +564,12 @@ igb_rx_write_range(struct igb_rx_queue *rxq, uint16_t from, uint16_t to)
 
 		igb_rx_buf_sync_for_device(mb);
 		rxd->read.hdr_addr = 0;
-		rxd->read.pkt_addr = rte_cpu_to_le_64(rte_mbuf_data_iova_default(mb));
+		rxd->read.pkt_addr = rte_cpu_to_le_64(rte_pci_dma_iova(&rxq->dma,
+			rte_mbuf_data_iova_default(mb),
+			mb->buf_len - RTE_PKTMBUF_HEADROOM));
 	}
 	igb_dma_sync_for_device(&rxq->rx_ring[from],
-			(to - from) * sizeof(*rxq->rx_ring));
+			(to - from) * sizeof(*rxq->rx_ring), RTE_MEM_SYNC_TO_DEVICE);
 }
 
 /*
@@ -538,9 +579,9 @@ igb_rx_write_range(struct igb_rx_queue *rxq, uint16_t from, uint16_t to)
 static inline uint16_t
 igb_rx_flush_refills(struct igb_rx_queue *rxq, uint16_t rx_id)
 {
-	uint16_t per_line = igb_rx_desc_per_line(rxq);
+	uint16_t mask = igb_rx_desc_per_line(rxq) - 1;
 	uint16_t start = rxq->rx_unwritten;
-	uint16_t end = rx_id - rx_id % per_line;
+	uint16_t end = rx_id & ~mask;
 
 	if (end == start)
 		return start;
@@ -590,6 +631,10 @@ igb_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts, uint16_t nb_pkts,
 
 	for (nb_tx = 0; nb_tx < nb_pkts; nb_tx++) {
 		tx_pkt = *tx_pkts++;
+		if (nc && (tx_pkt->nb_segs == 0 ||
+				tx_pkt->nb_segs >= txq->nb_tx_desc ||
+				!igb_tx_pkt_reachable(txq, tx_pkt)))
+			break;
 		pkt_len = tx_pkt->pkt_len;
 
 		RTE_MBUF_PREFETCH_TO_FREE(txe->mbuf);
@@ -766,8 +811,12 @@ igb_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts, uint16_t nb_pkts,
 			 */
 			slen = (uint16_t) m_seg->data_len;
 			buf_dma_addr = rte_mbuf_data_iova(m_seg);
-			if (nc)
-				igb_dma_sync_for_device(rte_pktmbuf_mtod(m_seg, void *), slen);
+			if (nc) {
+				buf_dma_addr = rte_pci_dma_iova(&txq->dma,
+						buf_dma_addr, slen);
+				igb_dma_sync_for_device(rte_pktmbuf_mtod(m_seg, void *),
+						slen, RTE_MEM_SYNC_TO_DEVICE);
+			}
 			txd->read.buffer_addr =
 				rte_cpu_to_le_64(buf_dma_addr);
 			txd->read.cmd_type_len =
@@ -1094,6 +1143,11 @@ igb_recv_pkts(void *rx_queue, struct rte_mbuf **rx_pkts, uint16_t nb_pkts,
 			break;
 		}
 
+		if (nc && !igb_rx_buf_usable(&rxq->dma, nmb)) {
+			rte_pktmbuf_free(nmb);
+			rte_eth_devices[rxq->port_id].data->rx_mbuf_alloc_failed++;
+			break;
+		}
 		nb_hold++;
 		rxe = &sw_ring[rx_id];
 		rx_id++;
@@ -1192,12 +1246,18 @@ igb_recv_pkts(void *rx_queue, struct rte_mbuf **rx_pkts, uint16_t nb_pkts,
 			   (unsigned) rxq->port_id, (unsigned) rxq->queue_id,
 			   (unsigned) rx_id, (unsigned) nb_hold,
 			   (unsigned) nb_rx);
-		if (nc)
+		if (nc) {
+			uint16_t first = rxq->rx_unwritten;
+
+			/* Only the descriptors actually posted stop being held. */
 			rx_id = igb_rx_flush_refills(rxq, rx_id);
+			nb_hold -= (rx_id + rxq->nb_rx_desc - first) % rxq->nb_rx_desc;
+		} else {
+			nb_hold = 0;
+		}
 		rx_id = (uint16_t) ((rx_id == 0) ?
 				     (rxq->nb_rx_desc - 1) : (rx_id - 1));
 		E1000_PCI_REG_WRITE(rxq->rdt_reg_addr, rx_id);
-		nb_hold = 0;
 	}
 	rxq->nb_rx_hold = nb_hold;
 	return nb_rx;
@@ -1308,6 +1368,11 @@ igb_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 			break;
 		}
 
+		if (nc && !igb_rx_buf_usable(&rxq->dma, nmb)) {
+			rte_pktmbuf_free(nmb);
+			rte_eth_devices[rxq->port_id].data->rx_mbuf_alloc_failed++;
+			break;
+		}
 		nb_hold++;
 		rxe = &sw_ring[rx_id];
 		rx_id++;
@@ -1477,12 +1542,18 @@ igb_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 			   (unsigned) rxq->port_id, (unsigned) rxq->queue_id,
 			   (unsigned) rx_id, (unsigned) nb_hold,
 			   (unsigned) nb_rx);
-		if (nc)
+		if (nc) {
+			uint16_t first = rxq->rx_unwritten;
+
+			/* Only the descriptors actually posted stop being held. */
 			rx_id = igb_rx_flush_refills(rxq, rx_id);
+			nb_hold -= (rx_id + rxq->nb_rx_desc - first) % rxq->nb_rx_desc;
+		} else {
+			nb_hold = 0;
+		}
 		rx_id = (uint16_t) ((rx_id == 0) ?
 				     (rxq->nb_rx_desc - 1) : (rx_id - 1));
 		E1000_PCI_REG_WRITE(rxq->rdt_reg_addr, rx_id);
-		nb_hold = 0;
 	}
 	rxq->nb_rx_hold = nb_hold;
 	return nb_rx;
@@ -1583,7 +1654,7 @@ igb_tx_done_cleanup(struct igb_tx_queue *txq, uint32_t free_cnt)
 		tx_last = sw_ring[tx_id].last_id;
 
 		if (sw_ring[tx_last].mbuf) {
-			if (igb_tx_desc_done(txq, tx_last, txq->dma_noncoherent)) {
+			if (igb_tx_desc_done(txq, tx_last, txq->dma_active)) {
 				/* Increment the number of packets
 				 * freed.
 				 */
@@ -1810,10 +1881,27 @@ eth_igb_tx_queue_setup(struct rte_eth_dev *dev,
 	txq->reg_idx = (uint16_t)((RTE_ETH_DEV_SRIOV(dev).active == 0) ?
 		queue_idx : RTE_ETH_DEV_SRIOV(dev).def_pool_q_idx + queue_idx);
 	txq->port_id = dev->data->port_id;
-	txq->dma_noncoherent = E1000_DEV_PRIVATE(dev->data->dev_private)->dma_noncoherent;
+	txq->dma = E1000_DEV_PRIVATE(dev->data->dev_private)->dma;
+	txq->dma_active = E1000_DEV_PRIVATE(dev->data->dev_private)->dma_active;
+	txq->dma_per_line = 1;
+	if (txq->dma_active) {
+		txq->dma_per_line = rte_mem_dcache_line_size() /
+				sizeof(*txq->tx_ring);
+		/*
+		 * Write back every descriptor rather than coalescing: a burst
+		 * smaller than the threshold would otherwise wait for later
+		 * traffic before its Done bit appeared, and the ring would
+		 * fill with descriptors that are finished but unreclaimed.
+		 */
+		txq->wthresh = 0;
+	}
 
 	txq->tdt_reg_addr = E1000_PCI_REG_ADDR(hw, E1000_TDT(txq->reg_idx));
-	txq->tx_ring_phys_addr = tz->iova;
+	txq->tx_ring_phys_addr = rte_pci_dma_iova(&txq->dma, tz->iova, size);
+	if (txq->tx_ring_phys_addr == RTE_BAD_IOVA) {
+		igb_tx_queue_release(txq);
+		return -EINVAL;
+	}
 
 	txq->tx_ring = (union e1000_adv_tx_desc *) tz->addr;
 	/* Allocate software ring */
@@ -1882,6 +1970,8 @@ igb_reset_rx_queue(struct igb_rx_queue *rxq)
 
 	rxq->rx_tail = 0;
 	rxq->rx_unwritten = 0;
+	if (rxq->dma_active)
+		rxq->nb_rx_hold = 0;
 	rxq->pkt_first_seg = NULL;
 	rxq->pkt_last_seg = NULL;
 }
@@ -1988,7 +2078,9 @@ eth_igb_rx_queue_setup(struct rte_eth_dev *dev,
 	rxq->reg_idx = (uint16_t)((RTE_ETH_DEV_SRIOV(dev).active == 0) ?
 		queue_idx : RTE_ETH_DEV_SRIOV(dev).def_pool_q_idx + queue_idx);
 	rxq->port_id = dev->data->port_id;
-	rxq->dma_noncoherent = E1000_DEV_PRIVATE(dev->data->dev_private)->dma_noncoherent;
+	rxq->dma = E1000_DEV_PRIVATE(dev->data->dev_private)->dma;
+	rxq->dma_active = E1000_DEV_PRIVATE(dev->data->dev_private)->dma_active;
+	rxq->dma_per_line = 1;
 	if (dev->data->dev_conf.rxmode.offloads & RTE_ETH_RX_OFFLOAD_KEEP_CRC)
 		rxq->crc_len = RTE_ETHER_CRC_LEN;
 	else
@@ -2010,8 +2102,21 @@ eth_igb_rx_queue_setup(struct rte_eth_dev *dev,
 	rxq->mz = rz;
 	rxq->rdt_reg_addr = E1000_PCI_REG_ADDR(hw, E1000_RDT(rxq->reg_idx));
 	rxq->rdh_reg_addr = E1000_PCI_REG_ADDR(hw, E1000_RDH(rxq->reg_idx));
-	rxq->rx_ring_phys_addr = rz->iova;
+	rxq->rx_ring_phys_addr = rte_pci_dma_iova(&rxq->dma, rz->iova, size);
+	if (rxq->rx_ring_phys_addr == RTE_BAD_IOVA) {
+		igb_rx_queue_release(rxq);
+		return -EINVAL;
+	}
 	rxq->rx_ring = (union e1000_adv_rx_desc *) rz->addr;
+	if (rxq->dma_active) {
+		size_t line = rte_mem_dcache_line_size();
+		uint16_t per_line = line / sizeof(*rxq->rx_ring);
+
+		/* Refill by whole lines only where lines tile the ring. */
+		if (per_line > 1 && rxq->nb_rx_desc % per_line == 0 &&
+				((uintptr_t)rxq->rx_ring & (line - 1)) == 0)
+			rxq->dma_per_line = per_line;
+	}
 
 	/* Allocate software ring. */
 	rxq->sw_ring = rte_zmalloc("rxq->sw_ring",
@@ -2042,7 +2147,7 @@ eth_igb_rx_queue_count(void *rx_queue)
 	rxdp = &(rxq->rx_ring[rxq->rx_tail]);
 
 	while (desc < rxq->nb_rx_desc) {
-		if (rxq->dma_noncoherent)
+		if (rxq->dma_active)
 			igb_dma_sync_for_cpu(rxdp, sizeof(*rxdp));
 		if ((rxdp->wb.upper.status_error & E1000_RXD_STAT_DD) == 0)
 			break;
@@ -2074,7 +2179,7 @@ eth_igb_rx_descriptor_status(void *rx_queue, uint16_t offset)
 		desc -= rxq->nb_rx_desc;
 
 	status = &rxq->rx_ring[desc].wb.upper.status_error;
-	if (rxq->dma_noncoherent)
+	if (rxq->dma_active)
 		igb_dma_sync_for_cpu(status, sizeof(*status));
 	if (*status & rte_cpu_to_le_32(E1000_RXD_STAT_DD))
 		return RTE_ETH_RX_DESC_DONE;
@@ -2095,7 +2200,7 @@ eth_igb_tx_descriptor_status(void *tx_queue, uint16_t offset)
 	if (desc >= txq->nb_tx_desc)
 		desc -= txq->nb_tx_desc;
 
-	if (igb_tx_desc_done(txq, desc, txq->dma_noncoherent))
+	if (igb_tx_desc_done(txq, desc, txq->dma_active))
 		return RTE_ETH_TX_DESC_DONE;
 
 	return RTE_ETH_TX_DESC_FULL;
@@ -2515,16 +2620,25 @@ igb_alloc_rx_queue_mbufs(struct igb_rx_queue *rxq)
 		}
 		dma_addr =
 			rte_cpu_to_le_64(rte_mbuf_data_iova_default(mbuf));
-		if (rxq->dma_noncoherent)
+		if (rxq->dma_active) {
+			if (!igb_rx_buf_usable(&rxq->dma, mbuf)) {
+				rte_pktmbuf_free(mbuf);
+				return -EINVAL;
+			}
+			dma_addr = rte_cpu_to_le_64(rte_pci_dma_iova(&rxq->dma,
+					rte_mbuf_data_iova_default(mbuf),
+					mbuf->buf_len - RTE_PKTMBUF_HEADROOM));
 			igb_rx_buf_sync_for_device(mbuf);
+		}
 		rxd = &rxq->rx_ring[i];
 		rxd->read.hdr_addr = 0;
 		rxd->read.pkt_addr = dma_addr;
 		rxe[i].mbuf = mbuf;
 	}
-	if (rxq->dma_noncoherent)
+	if (rxq->dma_active)
 		igb_dma_sync_for_device(rxq->rx_ring,
-				rxq->nb_rx_desc * sizeof(*rxq->rx_ring));
+				rxq->nb_rx_desc * sizeof(*rxq->rx_ring),
+				RTE_MEM_SYNC_TO_DEVICE);
 
 	return 0;
 }
@@ -2874,6 +2988,8 @@ eth_igb_tx_init(struct rte_eth_dev *dev)
 
 		/* Setup Transmit threshold registers. */
 		txdctl = E1000_READ_REG(hw, E1000_TXDCTL(txq->reg_idx));
+		if (txq->dma_active)
+			txdctl &= ~(0x1FU << 16);	/* the field is OR-ed below */
 		txdctl |= txq->pthresh & 0x1F;
 		txdctl |= ((txq->hthresh & 0x1F) << 8);
 		txdctl |= ((txq->wthresh & 0x1F) << 16);

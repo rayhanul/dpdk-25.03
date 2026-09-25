@@ -2,7 +2,6 @@
  * Copyright(c) 2026 Md Rayhanul Islam
  */
 
-#include <dirent.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
@@ -10,83 +9,86 @@
 #include <string.h>
 #include <unistd.h>
 
-#include <rte_common.h>
 #include <rte_byteorder.h>
-#include <rte_memory.h>
-#include <rte_pci.h>
-#include <rte_bus_pci.h>
-#include <eal_export.h>
-
+#include <rte_common.h>
 #include <rte_string_fns.h>
 
 #include "pci_init.h"
 #include "private.h"
 
+/* Read a device tree property, returning its length or a negative errno. */
 static int
-dt_read_prop(const char *dir, const char *prop, void *buf, size_t buflen,
-		size_t *outlen)
+dt_read(const char *node, const char *name, void *buf, size_t size)
 {
 	char path[PATH_MAX];
-	size_t n;
+	size_t len;
+	int ret;
 	FILE *f;
 
-	if (snprintf(path, sizeof(path), "%s/%s", dir, prop) >= (int)sizeof(path))
-		return -1;
+	if (snprintf(path, sizeof(path), "%s/%s", node, name) >= (int)sizeof(path))
+		return -ENAMETOOLONG;
 	f = fopen(path, "rb");
 	if (f == NULL)
-		return -1;
-	n = fread(buf, 1, buflen, f);
-	if (ferror(f)) {
-		fclose(f);
-		return -1;
-	}
+		return -errno;
+	len = fread(buf, 1, size, f);
+	ret = ferror(f) ? -EIO : (int)len;
+	if (ret >= 0 && fgetc(f) != EOF)
+		ret = -E2BIG;		/* longer than this parser handles */
 	fclose(f);
-	*outlen = n;
-	return 0;
+	return ret;
+}
+
+static bool
+dt_is_known_bridge(const char *node)
+{
+	static const char * const compatible[] = { "brcm,bcm2711-pcie" };
+	char buf[256];
+	size_t pos, n, i;
+	int len;
+
+	len = dt_read(node, "compatible", buf, sizeof(buf));
+	if (len <= 0 || buf[len - 1] != '\0')
+		return false;
+	for (pos = 0; pos < (size_t)len; pos += n + 1) {	/* NUL-separated */
+		n = strlen(buf + pos);
+		for (i = 0; i < RTE_DIM(compatible); i++)
+			if (strcmp(buf + pos, compatible[i]) == 0)
+				return true;
+	}
+	return false;
 }
 
 static int
-dt_read_u32(const char *dir, const char *prop, uint32_t *out)
+dt_cells(const char *node, const char *name)
 {
-	uint32_t val;
-	size_t len;
+	rte_be32_t value;
 
-	if (dt_read_prop(dir, prop, &val, sizeof(val), &len) < 0 ||
-			len != sizeof(val))
-		return -1;
-	*out = rte_be_to_cpu_32(val);
-	return 0;
+	if (dt_read(node, name, &value, sizeof(value)) != sizeof(value))
+		return -EINVAL;
+	return rte_be_to_cpu_32(value);
 }
 
 static uint64_t
-dt_read_cells(const uint32_t *cells, uint32_t n)
+dt_address(const rte_be32_t *cells, int n)
 {
-	uint64_t val = 0;
-	uint32_t i;
+	uint64_t value = 0;
 
-	for (i = 0; i < n; i++)
-		val = (val << 32) | rte_be_to_cpu_32(cells[i]);
-	return val;
+	while (n-- > 0)
+		value = (value << 32) | rte_be_to_cpu_32(*cells++);
+	return value;
 }
 
-/* -ENOENT: no "dma-ranges" here.  -EINVAL: one that is not a single offset. */
+/*
+ * Read the one memory window a bridge declares in "dma-ranges".  An entry is
+ * <pci-address> <parent-address> <size>: 3 cells, then the parent's
+ * #address-cells, then this node's #size-cells.
+ */
 static int
-dt_bridge_dma_offset(const char *node, uint64_t *offset)
+dt_dma_window(const char *node, struct rte_pci_dma_info *info)
 {
 	char parent[PATH_MAX], *slash;
-	uint32_t cells[256];
-	uint32_t parent_ac, size_c;
-	size_t len, ncells, per_entry, i;
-	uint64_t off = 0;
-	bool first = true;
-
-	if (dt_read_prop(node, "dma-ranges", cells, sizeof(cells), &len) < 0)
-		return -ENOENT;
-
-	if (len == 0) {
-		*offset = 0;
-		return 0;
-	}
+	rte_be32_t cells[7];
+	int ac, len;
 
 	strlcpy(parent, node, sizeof(parent));
 	slash = strrchr(parent, '/');
@@ -94,109 +96,82 @@ dt_bridge_dma_offset(const char *node, uint64_t *offset)
 		return -EINVAL;
 	*slash = '\0';
 
-	if (dt_read_u32(parent, "#address-cells", &parent_ac) < 0 ||
-			dt_read_u32(node, "#size-cells", &size_c) < 0)
+	ac = dt_cells(parent, "#address-cells");
+	if ((ac != 1 && ac != 2) || dt_cells(node, "#address-cells") != 3 ||
+			dt_cells(node, "#size-cells") != 2)
+		return -ENOTSUP;
+
+	len = dt_read(node, "dma-ranges", cells, sizeof(cells));
+	if (len < 0)
+		return len;
+	/* One directly addressed memory window is all this handles. */
+	if (len != (3 + ac + 2) * (int)sizeof(cells[0]) ||
+			(rte_be_to_cpu_32(cells[0]) & 0x03000000) != 0x02000000)
+		return -ENOTSUP;
+
+	info->bus_base = dt_address(cells + 1, 2);
+	info->cpu_base = dt_address(cells + 3, ac);
+	info->size = dt_address(cells + 3 + ac, 2);
+	if (info->size == 0 || info->size > UINT64_MAX - info->cpu_base ||
+			info->size > UINT64_MAX - info->bus_base)
 		return -EINVAL;
-	if (parent_ac == 0 || parent_ac > 2 || size_c > 2)
-		return -EINVAL;
-
-	per_entry = 3 + parent_ac + size_c;
-	ncells = len / sizeof(uint32_t);
-	if (ncells == 0 || ncells % per_entry != 0)
-		return -EINVAL;
-
-	for (i = 0; i < ncells; i += per_entry) {
-		uint64_t bus_addr = dt_read_cells(&cells[i + 1], 2);
-		uint64_t cpu_addr = dt_read_cells(&cells[i + 3], parent_ac);
-		uint64_t entry_off = bus_addr - cpu_addr;
-
-		if (first) {
-			off = entry_off;
-			first = false;
-		} else if (entry_off != off) {
-			PCI_LOG(ERR, "%s: non-uniform dma-ranges", node);
-			return -EINVAL;
-		}
-	}
-
-	*offset = off;
 	return 0;
 }
 
-static const char * const dt_bridge_compatible[] = {
-	"brcm,bcm2711-pcie",
-};
-
+/* Coherency is inherited: the nearest ancestor that declares it wins. */
 static bool
-dt_bridge_is_known(const char *node)
+dt_is_coherent(const char *node)
 {
-	char compat[256];
-	size_t len, i, pos;
-
-	if (dt_read_prop(node, "compatible", compat, sizeof(compat) - 1, &len) < 0)
-		return false;
-	compat[len] = '\0';
-
-	/* NUL-separated list. */
-	for (pos = 0; pos < len; pos += strlen(&compat[pos]) + 1)
-		for (i = 0; i < RTE_DIM(dt_bridge_compatible); i++)
-			if (strcmp(&compat[pos], dt_bridge_compatible[i]) == 0)
-				return true;
-	return false;
-}
-
-RTE_EXPORT_INTERNAL_SYMBOL(rte_pci_dma_is_coherent)
-bool
-rte_pci_dma_is_coherent(const struct rte_pci_device *dev)
-{
-	char path[PATH_MAX], node[PATH_MAX], prop[PATH_MAX];
-	bool described = false;
+	char path[PATH_MAX], value;
 	char *slash;
 
-	if (snprintf(path, sizeof(path), "%s/" PCI_PRI_FMT,
-			rte_pci_get_sysfs_path(), dev->addr.domain, dev->addr.bus,
-			dev->addr.devid, dev->addr.function) >= (int)sizeof(path) ||
-			realpath(path, node) == NULL)
-		return true;
-
-	while ((slash = strrchr(node, '/')) != NULL && slash != node) {
-		if (snprintf(prop, sizeof(prop), "%s/of_node", node) <
-				(int)sizeof(prop) && access(prop, F_OK) == 0) {
-			described = true;
-			if (snprintf(prop, sizeof(prop), "%s/of_node/dma-coherent",
-					node) < (int)sizeof(prop) &&
-					access(prop, F_OK) == 0)
-				return true;
-		}
+	strlcpy(path, node, sizeof(path));
+	for (;;) {
+		if (dt_read(path, "dma-coherent", &value, sizeof(value)) >= 0)
+			return true;
+		if (dt_read(path, "dma-noncoherent", &value, sizeof(value)) >= 0)
+			return false;
+		slash = strrchr(path, '/');
+		if (slash == NULL || slash == path)
+			return false;
 		*slash = '\0';
 	}
-	return !described;
 }
 
-/* Report the translation of the bridge this device sits behind. */
-int
-pci_dt_set_dma_offset(const char *dirname)
+/*
+ * Record what the bridge above this device says about its DMA.  A device that
+ * sits behind no known bridge keeps the identity mapping and is left coherent,
+ * which is what every platform did before.  Properties this parser cannot make
+ * sense of mark the device unusable rather than failing the scan: the bus
+ * refuses that one device at probe and everything else carries on.
+ */
+void
+pci_dt_read_dma_info(struct rte_pci_device *dev, const char *dirname)
 {
-	char path[PATH_MAX], node[PATH_MAX], of_node[PATH_MAX];
-	uint64_t offset;
+	struct rte_pci_dma_info *info = &RTE_PCI_DEVICE_INTERNAL(dev)->dma;
+	char node[PATH_MAX], path[PATH_MAX], of_node[PATH_MAX];
 	char *slash;
+	int ret;
 
+	memset(info, 0, sizeof(*info));
 	if (realpath(dirname, node) == NULL)
-		return 0;
+		return;
 
 	while ((slash = strrchr(node, '/')) != NULL && slash != node) {
-		if (snprintf(of_node, sizeof(of_node), "%s/of_node", node) <
-				(int)sizeof(of_node) &&
-				realpath(of_node, path) != NULL &&
-				dt_bridge_is_known(path)) {
-			int ret = dt_bridge_dma_offset(path, &offset);
-
-			if (ret == 0)
-				return rte_mem_set_iova_pa_offset(offset, path);
-			if (ret != -ENOENT)
-				return ret;
+		if (snprintf(path, sizeof(path), "%s/of_node", node) <
+				(int)sizeof(path) &&
+				realpath(path, of_node) != NULL &&
+				dt_is_known_bridge(of_node)) {
+			ret = dt_dma_window(of_node, info);
+			if (ret < 0) {
+				PCI_LOG(ERR, "%s: cannot use the DMA properties of %s",
+					dev->name, of_node);
+				info->unusable = true;
+				return;
+			}
+			info->noncoherent = !dt_is_coherent(of_node);
+			return;
 		}
 		*slash = '\0';
 	}
-	return 0;
 }

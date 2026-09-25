@@ -140,6 +140,8 @@ struct rte_pci_driver {
 #define RTE_PCI_DRV_KEEP_MAPPED_RES 0x0020
 /** Device driver needs IOVA as VA and cannot work with IOVA as PA */
 #define RTE_PCI_DRV_NEED_IOVA_AS_VA 0x0040
+/** Driver translates DMA addresses and maintains caches itself. */
+#define RTE_PCI_DRV_DMA_NONCOHERENT 0x0080
 
 /**
  * Register a PCI driver.

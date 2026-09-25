@@ -142,6 +142,14 @@ pci_unmap_resource(void *requested_addr, size_t size)
 		PCI_LOG(DEBUG, "  PCI memory unmapped at %p", requested_addr);
 }
 
+RTE_EXPORT_INTERNAL_SYMBOL(rte_pci_get_dma_info)
+void
+rte_pci_get_dma_info(const struct rte_pci_device *dev,
+		struct rte_pci_dma_info *info)
+{
+	*info = RTE_PCI_DEVICE_INTERNAL_CONST(dev)->dma;
+}
+
 static bool
 pci_bus_match(const struct rte_driver *drv, const struct rte_device *dev)
 {
@@ -193,8 +201,18 @@ pci_probe_device(struct rte_driver *drv, struct rte_device *dev)
 		loc->domain, loc->bus, loc->devid, loc->function,
 		pci_dev->device.numa_node);
 
+	const struct rte_pci_dma_info *dma;
+
 	if (pci_dev->device.numa_node < 0 && rte_socket_count() > 1)
 		PCI_LOG(INFO, "Device %s is not NUMA-aware", pci_dev->name);
+
+	dma = &RTE_PCI_DEVICE_INTERNAL(pci_dev)->dma;
+	if (dma->unusable || ((dma->noncoherent || dma->size != 0) &&
+			!(pci_drv->drv_flags & RTE_PCI_DRV_DMA_NONCOHERENT))) {
+		PCI_LOG(ERR, "%s: %s does not handle this device's DMA properties",
+			pci_dev->name, pci_drv->driver.name);
+		return -ENOTSUP;
+	}
 
 	already_probed = (pci_dev->intr_handle != NULL);
 	if (already_probed && !(pci_drv->drv_flags & RTE_PCI_DRV_PROBE_AGAIN)) {

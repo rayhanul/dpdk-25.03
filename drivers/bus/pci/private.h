@@ -13,6 +13,7 @@
 #include <rte_log.h>
 #include <rte_os_shim.h>
 #include <rte_pci.h>
+#include <rte_bus_pci.h>
 
 extern int pci_bus_logtype;
 #define RTE_LOGTYPE_PCI_BUS pci_bus_logtype
@@ -41,6 +42,8 @@ struct rte_pci_region {
 
 struct rte_pci_device_internal {
 	struct rte_pci_device device;
+	/* What the bridge above the device says about its DMA. */
+	struct rte_pci_dma_info dma;
 	/* PCI regions provided by e.g. VFIO. */
 	struct rte_pci_region region[RTE_MAX_PCI_REGIONS];
 };
