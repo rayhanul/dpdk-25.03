@@ -194,14 +194,13 @@ pci_probe_device(struct rte_driver *drv, struct rte_device *dev)
 	struct rte_pci_device *pci_dev = RTE_BUS_DEVICE(dev, *pci_dev);
 	struct rte_pci_driver *pci_drv = RTE_BUS_DRIVER(drv, *pci_drv);
 	struct rte_pci_addr *loc = &pci_dev->addr;
+	const struct rte_pci_dma_info *dma;
 	bool already_probed;
 	int ret;
 
 	PCI_LOG(DEBUG, "PCI device "PCI_PRI_FMT" on NUMA socket %i",
 		loc->domain, loc->bus, loc->devid, loc->function,
 		pci_dev->device.numa_node);
-
-	const struct rte_pci_dma_info *dma;
 
 	if (pci_dev->device.numa_node < 0 && rte_socket_count() > 1)
 		PCI_LOG(INFO, "Device %s is not NUMA-aware", pci_dev->name);

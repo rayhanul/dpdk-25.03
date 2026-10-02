@@ -594,7 +594,6 @@ pci_device_iova_mode(const struct rte_pci_driver *pdrv,
 {
 	enum rte_iova_mode iova_mode = RTE_IOVA_DC;
 
-	/* The bridge translates physical addresses, so IOVAs must be those. */
 	if (RTE_PCI_DEVICE_INTERNAL_CONST(pdev)->dma.size != 0)
 		return RTE_IOVA_PA;
 

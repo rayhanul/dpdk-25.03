@@ -16,7 +16,6 @@
 #include "pci_init.h"
 #include "private.h"
 
-/* Read a device tree property, returning its length or a negative errno. */
 static int
 dt_read(const char *node, const char *name, void *buf, size_t size)
 {
@@ -33,7 +32,7 @@ dt_read(const char *node, const char *name, void *buf, size_t size)
 	len = fread(buf, 1, size, f);
 	ret = ferror(f) ? -EIO : (int)len;
 	if (ret >= 0 && fgetc(f) != EOF)
-		ret = -E2BIG;		/* longer than this parser handles */
+		ret = -E2BIG;
 	fclose(f);
 	return ret;
 }
@@ -49,7 +48,7 @@ dt_is_known_bridge(const char *node)
 	len = dt_read(node, "compatible", buf, sizeof(buf));
 	if (len <= 0 || buf[len - 1] != '\0')
 		return false;
-	for (pos = 0; pos < (size_t)len; pos += n + 1) {	/* NUL-separated */
+	for (pos = 0; pos < (size_t)len; pos += n + 1) {
 		n = strlen(buf + pos);
 		for (i = 0; i < RTE_DIM(compatible); i++)
 			if (strcmp(buf + pos, compatible[i]) == 0)
@@ -78,11 +77,7 @@ dt_address(const rte_be32_t *cells, int n)
 	return value;
 }
 
-/*
- * Read the one memory window a bridge declares in "dma-ranges".  An entry is
- * <pci-address> <parent-address> <size>: 3 cells, then the parent's
- * #address-cells, then this node's #size-cells.
- */
+/* One <pci-address> <parent-address> <size> entry in "dma-ranges". */
 static int
 dt_dma_window(const char *node, struct rte_pci_dma_info *info)
 {
@@ -104,7 +99,6 @@ dt_dma_window(const char *node, struct rte_pci_dma_info *info)
 	len = dt_read(node, "dma-ranges", cells, sizeof(cells));
 	if (len < 0)
 		return len;
-	/* One directly addressed memory window is all this handles. */
 	if (len != (3 + ac + 2) * (int)sizeof(cells[0]) ||
 			(rte_be_to_cpu_32(cells[0]) & 0x03000000) != 0x02000000)
 		return -ENOTSUP;
@@ -118,7 +112,7 @@ dt_dma_window(const char *node, struct rte_pci_dma_info *info)
 	return 0;
 }
 
-/* Coherency is inherited: the nearest ancestor that declares it wins. */
+/* The nearest ancestor that declares coherency decides it. */
 static bool
 dt_is_coherent(const char *node)
 {
@@ -139,11 +133,8 @@ dt_is_coherent(const char *node)
 }
 
 /*
- * Record what the bridge above this device says about its DMA.  A device that
- * sits behind no known bridge keeps the identity mapping and is left coherent,
- * which is what every platform did before.  Properties this parser cannot make
- * sense of mark the device unusable rather than failing the scan: the bus
- * refuses that one device at probe and everything else carries on.
+ * Unparseable properties mark only this device unusable, so the scan of the
+ * other devices is not affected.
  */
 void
 pci_dt_read_dma_info(struct rte_pci_device *dev, const char *dirname)

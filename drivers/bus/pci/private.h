@@ -42,7 +42,6 @@ struct rte_pci_region {
 
 struct rte_pci_device_internal {
 	struct rte_pci_device device;
-	/* What the bridge above the device says about its DMA. */
 	struct rte_pci_dma_info dma;
 	/* PCI regions provided by e.g. VFIO. */
 	struct rte_pci_region region[RTE_MAX_PCI_REGIONS];

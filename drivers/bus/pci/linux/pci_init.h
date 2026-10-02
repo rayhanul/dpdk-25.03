@@ -73,7 +73,6 @@ int pci_vfio_unmap_resource(struct rte_pci_device *dev);
 
 int pci_vfio_is_enabled(void);
 
-/* Record the DMA properties of the bridge above this device. */
 void pci_dt_read_dma_info(struct rte_pci_device *dev, const char *dirname);
 
 #endif /* EAL_PCI_INIT_H_ */

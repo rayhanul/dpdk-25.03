@@ -174,28 +174,26 @@ int rte_pci_pasid_set_state(const struct rte_pci_device *dev,
 
 /**
  * @internal
- * What the host bridge above a device says about its DMA: the window it
- * translates into, and whether the traffic is coherent with the CPU caches.
- * A zero size means the identity mapping every other platform uses.
+ * DMA properties of the host bridge above a device.  A zero size means
+ * addresses are not translated.
  */
 struct rte_pci_dma_info {
-	uint64_t cpu_base;	/**< start of the window, CPU side. */
-	uint64_t bus_base;	/**< the same address as the device sees it. */
-	uint64_t size;		/**< window length, 0 if not translated. */
-	bool noncoherent;	/**< the CPU caches need maintaining by hand. */
-	bool unusable;		/**< properties this bus cannot honour. */
+	uint64_t cpu_base;
+	uint64_t bus_base;
+	uint64_t size;
+	bool noncoherent;
+	bool unusable;		/**< properties the bus could not parse. */
 };
 
 /**
  * @internal
- * Copy a device's DMA properties into driver-owned storage.  A driver that
- * supports secondary processes saves them in its shared data during the
- * primary's probe, since the bus context is not shared.
+ * Copy a device's DMA properties.  Drivers supporting secondary processes
+ * keep the copy in shared data.
  *
  * @param dev
  *   The PCI device.
  * @param info
- *   Filled in with the properties of the bridge above it.
+ *   Filled in with the bridge's DMA properties.
  */
 __rte_internal
 void rte_pci_get_dma_info(const struct rte_pci_device *dev,
@@ -203,18 +201,10 @@ void rte_pci_get_dma_info(const struct rte_pci_device *dev,
 
 /**
  * @internal
- * Translate an IOVA range into an address the device can reach, or
- * RTE_BAD_IOVA if it falls outside the window.  Addresses outside a
- * translated window are unreachable, so a driver must check every one.
+ * Translate an IOVA range into a device address.
  *
- * @param info
- *   The device's DMA properties.
- * @param iova
- *   The address as EAL knows it.
- * @param len
- *   Length of the range, which must fit in the window as well.
  * @return
- *   The device-side address, or RTE_BAD_IOVA.
+ *   The device address, or RTE_BAD_IOVA if the range is outside the window.
  */
 static inline rte_iova_t
 rte_pci_dma_iova(const struct rte_pci_dma_info *info, rte_iova_t iova,

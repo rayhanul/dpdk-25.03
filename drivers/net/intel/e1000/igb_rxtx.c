@@ -50,12 +50,8 @@
 #include "e1000_ethdev.h"
 
 /*
- * On a bus that is not cache coherent the NIC reads stale descriptors and
- * packet data, so both are written back before the tail register is rung, and
- * invalidated before the CPU reads what the NIC wrote.  Such a bridge also
- * translates addresses, so every address handed to the NIC goes through the
- * device's DMA window first.  A cache line holds four descriptors, which is
- * why neither side ever writes a line the other still owns.
+ * Non-coherent DMA: addresses go through the device's DMA window, and
+ * descriptors and buffers are synced around every handover.
  */
 void
 igb_dma_set_burst(struct rte_eth_dev *dev)
@@ -98,7 +94,6 @@ igb_dma_probe(struct rte_eth_dev *dev)
 	return 0;
 }
 
-/* Make [addr, addr + len) visible to the NIC. */
 static inline void
 igb_dma_sync_for_device(const volatile void *addr, size_t len,
 		enum rte_mem_sync_direction dir)
@@ -107,7 +102,6 @@ igb_dma_sync_for_device(const volatile void *addr, size_t len,
 		rte_mem_sync_for_device((const void *)(uintptr_t)addr, len, dir);
 }
 
-/* Make what the NIC wrote visible to the CPU. */
 static inline void
 igb_dma_sync_for_cpu(const volatile void *addr, size_t len)
 {
@@ -116,7 +110,6 @@ igb_dma_sync_for_cpu(const volatile void *addr, size_t len)
 				RTE_MEM_SYNC_FROM_DEVICE);
 }
 
-/* The NIC writes into this buffer next, so clean it as well as invalidate. */
 static inline void
 igb_rx_buf_sync_for_device(struct rte_mbuf *mb)
 {
@@ -125,7 +118,6 @@ igb_rx_buf_sync_for_device(struct rte_mbuf *mb)
 			RTE_MEM_SYNC_FROM_DEVICE);
 }
 
-/* A buffer the NIC may fill must be reachable and own its cache lines. */
 static inline bool
 igb_rx_buf_usable(const struct rte_pci_dma_info *dma, struct rte_mbuf *mb)
 {
@@ -142,7 +134,6 @@ igb_rx_buf_usable(const struct rte_pci_dma_info *dma, struct rte_mbuf *mb)
 			RTE_BAD_IOVA;
 }
 
-/* Sync descriptors [from, to), handling wrap. */
 static inline void
 igb_dma_sync_ring(const volatile void *ring, size_t desc_size, uint16_t nb_desc,
 		uint16_t from, uint16_t to)
@@ -510,11 +501,19 @@ tx_desc_vlan_flags_to_cmdtype(uint64_t ol_flags)
 }
 
 /*
- * Cleaning a line writes back the CPU's copy of its neighbours, which can
- * erase a Done bit the NIC had just set.  That loses a completion but never
- * invents one, and the NIC works through the ring in order, so a Done bit on
- * the newest descriptor that asked for status covers everything before it.
+ * Refresh a descriptor line before writing it, so the clean that publishes it
+ * does not erase Done bits the NIC set on its neighbours.
  */
+static inline void
+igb_tx_line_acquire(struct igb_tx_queue *txq, uint16_t desc)
+{
+	uint16_t line = desc & ~(uint16_t)(txq->dma_per_line - 1);
+
+	igb_dma_sync_for_cpu(&txq->tx_ring[line],
+			txq->dma_per_line * sizeof(*txq->tx_ring));
+}
+
+/* Completion is in order, so Done on the last RS descriptor covers this one. */
 static inline bool
 igb_tx_desc_done(struct igb_tx_queue *txq, uint16_t desc, const bool nc)
 {
@@ -532,7 +531,6 @@ igb_tx_desc_done(struct igb_tx_queue *txq, uint16_t desc, const bool nc)
 	return (*status & rte_cpu_to_le_32(E1000_TXD_STAT_DD)) != 0;
 }
 
-/* Every segment has to fall inside the window before any of it is posted. */
 static bool
 igb_tx_pkt_reachable(struct igb_tx_queue *txq, struct rte_mbuf *mb)
 {
@@ -545,14 +543,12 @@ igb_tx_pkt_reachable(struct igb_tx_queue *txq, struct rte_mbuf *mb)
 	return mb == NULL && n == expected;
 }
 
-/* Descriptors per D-cache line, or 1 if a line does not tile the ring. */
 static inline uint16_t
 igb_rx_desc_per_line(struct igb_rx_queue *rxq)
 {
 	return rxq->dma_per_line;
 }
 
-/* Write the refilled buffer addresses for [from, to) and flush them. */
 static inline void
 igb_rx_write_range(struct igb_rx_queue *rxq, uint16_t from, uint16_t to)
 {
@@ -572,10 +568,7 @@ igb_rx_write_range(struct igb_rx_queue *rxq, uint16_t from, uint16_t to)
 			(to - from) * sizeof(*rxq->rx_ring), RTE_MEM_SYNC_TO_DEVICE);
 }
 
-/*
- * Write back the whole cache lines of descriptors the NIC has finished with,
- * and return the first one still unwritten, which bounds how far RDT may go.
- */
+/* Post whole descriptor lines; returns the first one not yet posted. */
 static inline uint16_t
 igb_rx_flush_refills(struct igb_rx_queue *rxq, uint16_t rx_id)
 {
@@ -586,7 +579,6 @@ igb_rx_flush_refills(struct igb_rx_queue *rxq, uint16_t rx_id)
 	if (end == start)
 		return start;
 	if (end < start) {
-		/* Wrapped: finish the ring, then the aligned part from 0. */
 		igb_rx_write_range(rxq, start, rxq->nb_rx_desc);
 		start = 0;
 	}
@@ -812,6 +804,9 @@ igb_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts, uint16_t nb_pkts,
 			slen = (uint16_t) m_seg->data_len;
 			buf_dma_addr = rte_mbuf_data_iova(m_seg);
 			if (nc) {
+				if ((tx_id & (txq->dma_per_line - 1)) == 0 ||
+						tx_id == txq->tx_tail)
+					igb_tx_line_acquire(txq, tx_id);
 				buf_dma_addr = rte_pci_dma_iova(&txq->dma,
 						buf_dma_addr, slen);
 				igb_dma_sync_for_device(rte_pktmbuf_mtod(m_seg, void *),
@@ -1249,7 +1244,6 @@ igb_recv_pkts(void *rx_queue, struct rte_mbuf **rx_pkts, uint16_t nb_pkts,
 		if (nc) {
 			uint16_t first = rxq->rx_unwritten;
 
-			/* Only the descriptors actually posted stop being held. */
 			rx_id = igb_rx_flush_refills(rxq, rx_id);
 			nb_hold -= (rx_id + rxq->nb_rx_desc - first) % rxq->nb_rx_desc;
 		} else {
@@ -1545,7 +1539,6 @@ igb_recv_scattered_pkts(void *rx_queue, struct rte_mbuf **rx_pkts,
 		if (nc) {
 			uint16_t first = rxq->rx_unwritten;
 
-			/* Only the descriptors actually posted stop being held. */
 			rx_id = igb_rx_flush_refills(rxq, rx_id);
 			nb_hold -= (rx_id + rxq->nb_rx_desc - first) % rxq->nb_rx_desc;
 		} else {
@@ -1774,6 +1767,10 @@ igb_reset_tx_queue(struct igb_tx_queue *txq, struct rte_eth_dev *dev)
 		txq->ctx_start = txq->queue_id * IGB_CTX_NUM;
 
 	igb_reset_tx_queue_stat(txq);
+	if (txq->dma_active)
+		igb_dma_sync_for_device(txq->tx_ring,
+				txq->nb_tx_desc * sizeof(*txq->tx_ring),
+				RTE_MEM_SYNC_TO_DEVICE);
 }
 
 uint64_t
@@ -1887,12 +1884,6 @@ eth_igb_tx_queue_setup(struct rte_eth_dev *dev,
 	if (txq->dma_active) {
 		txq->dma_per_line = rte_mem_dcache_line_size() /
 				sizeof(*txq->tx_ring);
-		/*
-		 * Write back every descriptor rather than coalescing: a burst
-		 * smaller than the threshold would otherwise wait for later
-		 * traffic before its Done bit appeared, and the ring would
-		 * fill with descriptors that are finished but unreclaimed.
-		 */
 		txq->wthresh = 0;
 	}
 
@@ -2112,7 +2103,6 @@ eth_igb_rx_queue_setup(struct rte_eth_dev *dev,
 		size_t line = rte_mem_dcache_line_size();
 		uint16_t per_line = line / sizeof(*rxq->rx_ring);
 
-		/* Refill by whole lines only where lines tile the ring. */
 		if (per_line > 1 && rxq->nb_rx_desc % per_line == 0 &&
 				((uintptr_t)rxq->rx_ring & (line - 1)) == 0)
 			rxq->dma_per_line = per_line;
